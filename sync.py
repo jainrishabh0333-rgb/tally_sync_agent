@@ -59,6 +59,7 @@ log = logging.getLogger("sync")
 class Settings:
     tally: TallyConfig
     frappe: FrappeConfig
+    companies: list = dataclasses.field(default_factory=list)
     chunk_days: int = 31          # export vouchers in chunks to avoid timeouts
     overlap_days: int = 7         # re-pull recent days to catch back-dated edits
     fy_start_month: int = 4       # Indian financial year starts April
@@ -92,9 +93,16 @@ def load_settings(path: Path | None = None) -> Settings:
         api_secret=os.getenv("FRAPPE_API_SECRET", f.get("api_secret", "")),
     )
 
+    # Multi-company: `companies = [...]` is preferred. A single `company = "..."`
+    # still works, and an empty list means "every company open in Tally".
+    companies = t.get("companies") or []
+    if isinstance(companies, str):
+        companies = [companies]
+    if not companies and tally.company:
+        companies = [tally.company]
+
     missing = [
         n for n, v in (
-            ("tally.company", tally.company),
             ("frappe.url", frappe.url),
             ("frappe.api_key", frappe.api_key),
             ("frappe.api_secret", frappe.api_secret),
@@ -109,10 +117,47 @@ def load_settings(path: Path | None = None) -> Settings:
     return Settings(
         tally=tally,
         frappe=frappe,
+        companies=companies,
         chunk_days=int(s.get("chunk_days", 31)),
         overlap_days=int(s.get("overlap_days", 7)),
         fy_start_month=int(s.get("fy_start_month", 4)),
     )
+
+
+def resolve_companies(st: Settings) -> list:
+    """
+    Decide which companies to sync.
+
+    An empty `companies` list means "whatever is open in Tally right now",
+    which is the friendliest default on a server where companies come and go.
+    Configured names are checked against what Tally actually has open so a
+    typo surfaces as a warning instead of silently syncing nothing.
+    """
+    try:
+        open_now = [c["name"] for c in list_companies(st.tally)]
+    except TallyError:
+        open_now = []
+
+    if not st.companies:
+        if not open_now:
+            sys.exit("No companies configured and none open in Tally. Open a company, or list them in config.toml.")
+        log.info("No companies configured — syncing all %d open in Tally.", len(open_now))
+        return open_now
+
+    resolved, missing = [], []
+    for want in st.companies:
+        if want in open_now or not open_now:
+            resolved.append(want)
+        else:
+            missing.append(want)
+    for m in missing:
+        log.warning("Company %r is configured but not open in Tally — skipping.", m)
+    if not resolved:
+        sys.exit(
+            "None of the configured companies are open in Tally.\n"
+            "Open in Tally: " + (", ".join(open_now) or "(none)")
+        )
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +216,7 @@ def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date) -> int:
     return total
 
 
-def resolve_range(st: Settings, fc: FrappeClient, args) -> tuple[date, date]:
+def resolve_range(st: Settings, fc: FrappeClient, args, company: str = "") -> tuple[date, date]:
     today = date.today()
     if args.frm and args.to:
         return (
@@ -182,10 +227,11 @@ def resolve_range(st: Settings, fc: FrappeClient, args) -> tuple[date, date]:
         return fy_start(today, st.fy_start_month), today
 
     # Incremental: resume from the last synced voucher date, minus an overlap
-    # window so back-dated or edited vouchers get picked up again.
+    # window so back-dated or edited vouchers get picked up again. Each company
+    # tracks its own high-water mark.
     state = {}
     try:
-        state = fc.get_sync_state()
+        state = fc.get_sync_state(company)
     except FrappeError as exc:
         log.warning("Could not read sync state (%s) — falling back to full sync.", exc)
 
@@ -259,25 +305,49 @@ def main() -> int:
 
     fc = FrappeClient(st.frappe)
     started = datetime.now()
-    counts = {"ledgers": 0, "vouchers": 0}
 
-    try:
-        if not args.vouchers_only:
-            counts["ledgers"] = sync_ledgers(st, fc)
-        if not args.ledgers_only:
-            frm, to = resolve_range(st, fc, args)
-            counts["vouchers"] = sync_vouchers(st, fc, frm, to)
-            counts["range"] = f"{frm}..{to}"
-    except (TallyError, FrappeError) as exc:
-        log.error("Sync failed: %s", exc)
-        fc.log_sync("Failed", {"error": str(exc), **counts})
-        return 1
+    companies = [args.company] if args.company else resolve_companies(st)
+    log.info("Syncing %d compan%s: %s",
+             len(companies), "y" if len(companies) == 1 else "ies", ", ".join(companies))
 
-    elapsed = (datetime.now() - started).total_seconds()
-    counts["seconds"] = round(elapsed, 1)
-    log.info("Sync complete in %.1fs — %s", elapsed, counts)
-    fc.log_sync("Success", counts)
-    return 0
+    totals = {"ledgers": 0, "vouchers": 0}
+    failed: list = []
+
+    for company in companies:
+        # Each company is its own Tally export scope.
+        st.tally.company = company
+        c_started = datetime.now()
+        counts = {"company": company, "ledgers": 0, "vouchers": 0}
+        log.info("--- %s ---", company)
+        try:
+            if not args.vouchers_only:
+                counts["ledgers"] = sync_ledgers(st, fc)
+            if not args.ledgers_only:
+                frm, to = resolve_range(st, fc, args, company)
+                counts["vouchers"] = sync_vouchers(st, fc, frm, to)
+                counts["range"] = f"{frm}..{to}"
+        except (TallyError, FrappeError) as exc:
+            # One bad company must not abort the rest.
+            log.error("Sync failed for %s: %s", company, exc)
+            counts["error"] = str(exc)
+            counts["seconds"] = round((datetime.now() - c_started).total_seconds(), 1)
+            fc.log_sync("Failed", counts)
+            failed.append(company)
+            continue
+
+        counts["seconds"] = round((datetime.now() - c_started).total_seconds(), 1)
+        totals["ledgers"] += counts["ledgers"]
+        totals["vouchers"] += counts["vouchers"]
+        log.info("%s: %d ledgers, %d vouchers in %.1fs",
+                 company, counts["ledgers"], counts["vouchers"], counts["seconds"])
+        fc.log_sync("Success", counts)
+
+    elapsed = round((datetime.now() - started).total_seconds(), 1)
+    log.info("All done in %.1fs — %d ledgers, %d vouchers across %d compan%s%s",
+             elapsed, totals["ledgers"], totals["vouchers"], len(companies),
+             "y" if len(companies) == 1 else "ies",
+             f" ({len(failed)} failed: {', '.join(failed)})" if failed else "")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

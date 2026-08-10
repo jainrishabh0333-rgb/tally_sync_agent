@@ -5,14 +5,39 @@
 # host as "localhost". Otherwise use that machine's LAN IP, e.g. "192.168.1.7".
 host = "localhost"
 port = 9000
-# EXACT company name as it appears in Tally (run `python sync.py --check` to list).
-company = "SN JAIN INDUSTRIES"
 timeout = 120
 
+# Which Tally company files to sync.
+#
+# Leave the list EMPTY to sync every company currently open in Tally — the
+# easiest option, and it picks up a new financial year automatically.
+#
+# IMPORTANT: a company must be OPEN in the TallyPrime instance that owns
+# port 9000 for it to be readable. Run `python test_tally.py` to see exactly
+# which companies that instance can see.
+#
+# Names must match Tally EXACTLY, including punctuation and spacing.
+companies = [
+  # --- financial-year files for the main entity ---
+  # "SN JAIN INDUSTRIES PVT LTD - (22-23)",
+  # "SN JAIN INDUSTRIES PVT LTD - (23-24)",
+  # "SN JAIN INDUSTRIES PVT LTD - (24-25)",
+  # "SN JAIN INDUSTRIES PVT LTD - (25-26)",
+  # "SN JAIN INDUSTRIES PVT LTD - (26-27)",
+  # --- separate units / divisions ---
+  # "Sn Jain Industries Pvt.Ltd.(Online)",
+  # "Sn Jain Industries Pvt.Ltd.(Unit-C26)",
+  # "Sn Jain Industries Pvt.Ltd.(Unit-E29)",
+  # "Sn Jain Industries Pvt.Ltd.(VMart)",
+]
+
+# Single-company shorthand, still supported. Ignored when `companies` is set.
+# company = "SN JAIN INDUSTRIES PVT LTD - (25-26)"
+
 [frappe]
-# Your Frappe Cloud site, no trailing slash.
+# Your Frappe site, no trailing slash.
 url = "https://yourcompany.frappe.cloud"
-# Generate under: Frappe desk > user > Settings > API Access > Generate Keys
+# Frappe desk > user > Settings > API Access > Generate Keys
 api_key = "xxxxxxxxxxxxxxx"
 api_secret = "xxxxxxxxxxxxxxx"
 
@@ -20,7 +45,7 @@ api_secret = "xxxxxxxxxxxxxxx"
 # Vouchers are exported in date chunks so large books don't time out.
 chunk_days = 31
 # On each incremental run, re-pull this many days before the last synced date,
-# so back-dated entries and edits are caught.
+# so back-dated entries and edits are caught. Tracked per company.
 overlap_days = 7
 # Financial year start month (4 = April, Indian FY).
 fy_start_month = 4

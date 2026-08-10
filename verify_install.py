@@ -60,6 +60,16 @@ except ModuleNotFoundError:  # pragma: no cover
 HERE = Path(__file__).resolve().parent
 WIDTH = 78
 
+# Guest-accessible liveness endpoints. The name has moved between Frappe
+# versions, so try each — any one of them answering proves a Frappe site.
+PING_PATHS = (
+    "/api/method/ping",
+    "/api/method/frappe.ping",
+    "/api/method/frappe.handler.ping",
+)
+# Keys that only ever appear in a Frappe JSON response, error or not.
+FRAPPE_KEYS = ("message", "data", "exc_type", "exception", "_server_messages")
+
 # (DocType, parent DocType if it is a child table)
 DOCTYPES = [
     ("Tally Ledger", None),
@@ -95,9 +105,15 @@ FIX_SERVER_ERROR = (
     "usual cause is a missing database table, which a migrate fixes: "
     "site > Migrate in Frappe Cloud."
 )
-FIX_BAD_ROLE = (
-    "The API key works but its user lacks the role. In Frappe desk open User > "
-    "the sync user > Roles and tick 'System Manager', then re-run this script."
+FIX_WRITE_ROLE = (
+    "Ingestion is restricted to System Manager. In Frappe desk open User > the "
+    "sync user > Roles, tick 'System Manager', save, then re-run this script."
+)
+FIX_READ_ROLE = (
+    "The key is valid but its user cannot read the mirrored data. In Frappe "
+    "desk open User > that user > Roles and add a role the Tally DocTypes "
+    "grant read to — 'System Manager' for the sync user, 'Accounts User' for "
+    "the read-only MCP user."
 )
 FIX_MISSING_DOCTYPE = (
     "The app is on the bench but this site has no tables for it. Open the site "
@@ -406,9 +422,28 @@ def load_creds(args) -> Creds:
 # Checks
 # ---------------------------------------------------------------------------
 
+def is_frappe_json(res: Res) -> bool:
+    return isinstance(res.body, dict) and any(k in res.body for k in FRAPPE_KEYS)
+
+
 def check_site(rep: Report, api: Api, url: str) -> bool:
-    """1. Is there a live Frappe site at this address?"""
-    res = api.get("/api/method/frappe.ping")
+    """
+    1. Is there a live Frappe site at this address?
+
+    Probed WITHOUT credentials, so a bad API key cannot be mistaken for a dead
+    site. Frappe rejects invalid keys on guest endpoints too, which is why a
+    401 here still counts as "the site is alive" — check 2 judges the key.
+    """
+    res = Res()
+    for path in PING_PATHS:
+        res = api.get(path)
+        if res.network_error or res.status in (502, 503, 504):
+            break
+        if res.ok and res.message == "pong":
+            break
+        if res.status in (401, 403) and is_frappe_json(res):
+            break
+
     if res.network_error:
         what, fix = network_fix(res, url)
         rep.fail(what, fix)
@@ -423,7 +458,8 @@ def check_site(rep: Report, api: Api, url: str) -> bool:
         )
         return False
 
-    if res.ok and res.message == "pong":
+    alive = (res.ok and res.message == "pong") or is_frappe_json(res)
+    if alive:
         rep.ok(f"{url} is a live Frappe site (HTTP {res.status}).")
         if url.startswith("http://"):
             rep.warn(
@@ -434,7 +470,7 @@ def check_site(rep: Report, api: Api, url: str) -> bool:
 
     if res.status == 404:
         rep.fail(
-            f"{url} answered HTTP 404 for a core Frappe endpoint.",
+            f"{url} answered HTTP 404 and not like Frappe.",
             "That address is serving something, but it is not a Frappe site "
             "(often a parked domain or the wrong host). Double-check the URL — "
             "it should be the site root, e.g. https://yourcompany.frappe.cloud.",
@@ -600,7 +636,7 @@ def check_doctypes(rep: Report, api: Api) -> bool:
                 rep.ok(f"{doctype}: present (child table, read via {parent}).")
             else:
                 rep.fail(f"{doctype}: exists, but this key may not read it "
-                         f"(HTTP {rows.status}).", FIX_BAD_ROLE)
+                         f"(HTTP {rows.status}).", FIX_READ_ROLE)
                 all_ok = False
         elif rows.status is not None and rows.status >= 500:
             rep.fail(
@@ -635,7 +671,7 @@ def check_analytics(rep: Report, api: Api) -> bool:
 
         if res.is_denied():
             rep.fail(f"{name}: refused for this key (HTTP {res.status}). {why(res)}",
-                     FIX_BAD_ROLE)
+                     FIX_READ_ROLE)
             all_ok = False
             continue
 
@@ -685,7 +721,7 @@ def summarise(body) -> str:
     return "responded"
 
 
-def check_write(rep: Report, api: Api, ro: Api | None, ro_user: str) -> bool:
+def check_write(rep: Report, api: Api, ro: Api | None, ro_same: bool = False) -> bool:
     """6. The two-user model: the sync key writes, the read-only key must not."""
     all_ok = True
 
@@ -700,9 +736,7 @@ def check_write(rep: Report, api: Api, ro: Api | None, ro_user: str) -> bool:
     elif res.is_denied():
         rep.fail(
             f"Sync key CANNOT write (HTTP {res.status}). {why(res)}",
-            "Ingestion needs the System Manager role. In Frappe desk open "
-            "User > the sync user > Roles, tick 'System Manager', save, then "
-            "re-run. Without this the agent will fail on its first push.",
+            FIX_WRITE_ROLE + " Without it the agent fails on its first push.",
         )
         all_ok = False
     elif res.is_missing():
@@ -714,18 +748,25 @@ def check_write(rep: Report, api: Api, ro: Api | None, ro_user: str) -> bool:
         all_ok = False
 
     if ro is None:
-        rep.skip("No read-only key supplied, so the MCP server's key was not "
-                 "tested. Pass --readonly-key/--readonly-secret to check it.")
+        if ro_same:
+            rep.skip("Read-only key not tested: the same key was given for both "
+                     "roles, so there is no second user to check.")
+        else:
+            rep.skip("No read-only key supplied, so the MCP server's key was not "
+                     "tested. Pass --readonly-key/--readonly-secret to check it.")
         return all_ok
 
-    if not ro_user:
+    probe = ro.get("/api/method/frappe.auth.get_logged_user")
+    ro_user = probe.message if probe.ok and isinstance(probe.message, str) else ""
+    if not ro_user or ro_user == "Guest":
         rep.fail(
             "The read-only key was not accepted by the site, so its write "
-            "restriction could not be proven.",
+            f"restriction could not be proven. {why(probe)}",
             "Regenerate that key (Frappe desk > the MCP user > Settings > API "
             "Access), or leave --readonly-key off until it works.",
         )
         return False
+    rep.ok(f"Read-only key authenticates as '{ro_user}'.")
 
     res = ro.post("/api/method/tally_bridge.api.upsert_ledgers", json_body={"ledgers": []})
     if res.network_error:
@@ -770,6 +811,10 @@ def main() -> int:
     p.add_argument("--timeout", type=int, default=30, help="seconds per request")
     args = p.parse_args()
 
+    # A console that cannot render a dash must not kill the run.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
     creds = load_creds(args)
     total = 6
 
@@ -783,7 +828,8 @@ def main() -> int:
     api = Api(creds.url, creds.key, creds.secret, creds.timeout)
 
     rep.step(1, total, "Site reachable")
-    if not check_site(rep, api, creds.url):
+    anon = Api(creds.url, timeout=creds.timeout)  # no key: liveness, not access
+    if not check_site(rep, anon, creds.url):
         return finish(rep, total, stopped_at=1)
 
     rep.step(2, total, "Authentication")
@@ -805,23 +851,16 @@ def main() -> int:
 
     rep.step(6, total, "Write permissions (two-user security model)")
     ro = None
-    ro_user = ""
-    if creds.ro_key and creds.ro_secret:
-        if creds.ro_key == creds.key:
-            rep.warn(
-                "The read-only key is the same as the sync key.",
-                "Create a separate user for the MCP server with read-only roles, "
-                "so Claude can never write to the books.",
-            )
-        else:
-            ro = Api(creds.url, creds.ro_key, creds.ro_secret, creds.timeout)
-            probe = ro.get("/api/method/frappe.auth.get_logged_user")
-            ro_user = probe.message if probe.ok and isinstance(probe.message, str) else ""
-            if ro_user and ro_user != "Guest":
-                rep.ok(f"Read-only key authenticates as '{ro_user}'.")
-            else:
-                ro_user = ""
-    check_write(rep, api, ro, ro_user)
+    ro_same = bool(creds.ro_key) and creds.ro_key == creds.key
+    if ro_same:
+        rep.warn(
+            "The read-only key is the same as the sync key.",
+            "Create a separate Frappe user for the MCP server with read-only "
+            "roles, so Claude can never write to the books.",
+        )
+    elif creds.ro_key and creds.ro_secret:
+        ro = Api(creds.url, creds.ro_key, creds.ro_secret, creds.timeout)
+    check_write(rep, api, ro, ro_same)
 
     return finish(rep, total)
 
@@ -852,6 +891,8 @@ def finish(rep: Report, total: int, stopped_at: int = 0) -> int:
 
     print()
     print("  All checks passed. The site is ready for the sync agent.")
+    if rep.warned:
+        print("  The warning(s) above are worth a look, but nothing is blocking.")
     print("  Next: python sync.py --check, then python sync.py --full")
     print("=" * WIDTH)
     return 0

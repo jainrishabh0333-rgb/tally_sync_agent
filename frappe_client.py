@@ -87,9 +87,18 @@ class FrappeClient:
         except FrappeError as exc:  # logging must never kill the sync
             log.warning("Could not write sync log to Frappe: %s", exc)
 
-    def get_sync_state(self) -> dict[str, Any]:
-        """Returns {'last_voucher_date': 'YYYY-MM-DD' | None, ...}."""
-        out = self._call("GET", "/api/method/tally_bridge.api.get_sync_state")
+    def get_sync_state(self, company: str = "") -> dict[str, Any]:
+        """
+        Returns {'last_voucher_date': 'YYYY-MM-DD' | None, ...}.
+
+        Each company file tracks its own high-water mark, so a newly added
+        financial year resumes from its own start rather than inheriting
+        another year's progress.
+        """
+        out = self._call(
+            "GET", "/api/method/tally_bridge.api.get_sync_state",
+            params={"company": company} if company else None,
+        )
         return out.get("message", {}) if isinstance(out, dict) else {}
 
     def ping(self) -> str:

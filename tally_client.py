@@ -117,6 +117,7 @@ def _text(el: ET.Element | None) -> str:
 @dataclass
 class Ledger:
     name: str
+    company: str = ""                # which Tally company this belongs to
     parent: str = ""                 # ledger group
     opening_balance: float = 0.0
     closing_balance: float = 0.0
@@ -193,6 +194,7 @@ def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
         ledgers.append(
             Ledger(
                 name=name,
+                company=cfg.company,
                 parent=_text(el.find("PARENT")),
                 opening_balance=_to_float(_text(el.find("OPENINGBALANCE"))),
                 closing_balance=_to_float(_text(el.find("CLOSINGBALANCE"))),
@@ -223,6 +225,7 @@ class VoucherEntry:
 @dataclass
 class Voucher:
     guid: str
+    company: str
     voucher_type: str
     voucher_number: str
     date: str                        # ISO YYYY-MM-DD
@@ -281,6 +284,7 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
             continue
         v = Voucher(
             guid=guid,
+            company=cfg.company,
             voucher_type=_text(vel.find("VOUCHERTYPENAME")),
             voucher_number=_text(vel.find("VOUCHERNUMBER")),
             date=_tally_date_to_iso(_text(vel.find("DATE"))),

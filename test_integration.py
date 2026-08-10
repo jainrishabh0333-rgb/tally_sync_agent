@@ -49,7 +49,8 @@ def check_true(label, cond, hint=""):
 # ---------------------------------------------------------------------------
 
 COMPANIES_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
- <COMPANY NAME="SN JAIN INDUSTRIES"><STARTINGFROM>20250401</STARTINGFROM></COMPANY>
+ <COMPANY NAME="SN JAIN INDUSTRIES - (24-25)"><STARTINGFROM>20240401</STARTINGFROM></COMPANY>
+ <COMPANY NAME="SN JAIN INDUSTRIES - (25-26)"><STARTINGFROM>20250401</STARTINGFROM></COMPANY>
 </COLLECTION></DATA></BODY></ENVELOPE>"""
 
 LEDGERS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
@@ -200,6 +201,25 @@ class FrappeHandler(BaseHTTPRequestHandler):
             return self._json({"message": {"count": 2, "total_value": 177000.0, "rows": []}})
         if path.endswith("unbalanced_vouchers"):
             return self._json({"message": {"count": 0, "healthy": True, "rows": []}})
+        if path.endswith("companies"):
+            return self._json({"message": {"count": 2, "rows": [
+                {"company": "SN JAIN INDUSTRIES - (24-25)", "voucher_count": 2,
+                 "first_voucher": "2024-04-15", "last_voucher": "2025-03-31",
+                 "ledger_count": 3, "total_value": 177000.0},
+                {"company": "SN JAIN INDUSTRIES - (25-26)", "voucher_count": 2,
+                 "first_voucher": "2025-04-15", "last_voucher": "2026-03-31",
+                 "ledger_count": 3, "total_value": 177000.0},
+            ]}})
+        if path.endswith("compare_ledger"):
+            name = qs.get("ledger_name", [""])[0]
+            return self._json({"message": {
+                "ledger_name": name, "appears_in_companies": 2, "rows": [
+                    {"company": "SN JAIN INDUSTRIES - (24-25)", "closing_balance": 120000.0,
+                     "outstanding": 120000.0, "direction": "owes_us", "transaction_count": 8},
+                    {"company": "SN JAIN INDUSTRIES - (25-26)", "closing_balance": 168000.0,
+                     "outstanding": 168000.0, "direction": "owes_us",
+                     "transaction_count": 12, "change_vs_previous": 48000.0},
+                ]}})
         if path.endswith("search_ledgers"):
             return self._json({"message": {"count": 1, "rows": [
                 {"ledger_name": "Acme Traders & Co", "parent_group": "Sundry Debtors"}]}})
@@ -222,7 +242,8 @@ def main() -> int:
     from frappe_client import FrappeClient, FrappeConfig
     import sync
 
-    tcfg = TallyConfig(host="127.0.0.1", port=TALLY_PORT, company="SN JAIN INDUSTRIES")
+    tcfg = TallyConfig(host="127.0.0.1", port=TALLY_PORT,
+                       company="SN JAIN INDUSTRIES - (25-26)")
     fcfg = FrappeConfig(url=f"http://127.0.0.1:{FRAPPE_PORT}",
                         api_key="testkey", api_secret="testsecret")
     st = sync.Settings(tally=tcfg, frappe=fcfg, chunk_days=31, overlap_days=7)
@@ -230,7 +251,9 @@ def main() -> int:
 
     print("connectivity")
     companies = list_companies(tcfg)
-    check("company discovered", [c["name"] for c in companies], ["SN JAIN INDUSTRIES"])
+    check("both company files discovered", len(companies), 2)
+    check_true("company names carry the financial year",
+               all("(2" in c["name"] for c in companies))
     check("frappe auth ping", fc.ping(), "sync@snjain.local")
     check_true("auth header is token scheme",
                store["auth_seen"] and store["auth_seen"][-1] == "token testkey:testsecret")
@@ -285,6 +308,51 @@ def main() -> int:
     check("quarter splits into chunks", len(chunks), 3)
     check_true("day book request carried company",
                any("SN JAIN INDUSTRIES" in r for r in tally_requests))
+
+    print("\nmulti-company: the same names in two financial years must not collide")
+    seen_ledger_keys = set()
+    seen_voucher_guids = set()
+    store["ledgers"].clear(); store["vouchers"].clear()
+    for comp in ["SN JAIN INDUSTRIES - (24-25)", "SN JAIN INDUSTRIES - (25-26)"]:
+        st.tally.company = comp
+        sync.sync_ledgers(st, fc)
+        sync.sync_vouchers(st, fc, date(2025, 4, 1), date(2025, 4, 30))
+
+    check("ledgers pushed for both companies", len(store["ledgers"]), 6)
+    for l in store["ledgers"]:
+        check_true(f"ledger carries company ({l['name'][:18]})", bool(l.get("company")))
+        seen_ledger_keys.add((l["company"], l["name"]))
+    check("ledger (company, name) pairs are unique", len(seen_ledger_keys), 6)
+    check("same ledger name appears in both years",
+          len({n for _, n in seen_ledger_keys}), 3)
+
+    for v in store["vouchers"]:
+        check_true(f"voucher carries company", bool(v.get("company")))
+        seen_voucher_guids.add(v["guid"])
+    check_true("voucher payloads carry distinct company labels",
+               len({v["company"] for v in store["vouchers"]}) == 2,
+               f"got {{v['company'] for v in store['vouchers']}}")
+
+    print("\nledger docname keying (mirrors api.py _ledger_docname)")
+    import hashlib
+    def docname(company, name, guid=""):
+        guid = (guid or "").strip()
+        if guid:
+            return guid
+        key = f"{company}::{name}"
+        if len(key) <= 140:
+            return key
+        return f"{company[:100]}::{hashlib.md5(name.encode()).hexdigest()[:16]}"
+
+    a = docname("ACME 24-25", "Cash")
+    b = docname("ACME 25-26", "Cash")
+    check_true("same ledger in two years gets two distinct keys", a != b, f"{a} vs {b}")
+    check("guid wins when present", docname("X", "Cash", "guid-9"), "guid-9")
+    longname = "L" * 200
+    check_true("over-long name is hashed, stays within Frappe's 140 limit",
+               len(docname("C" * 50, longname)) <= 140)
+    check_true("hashing stays deterministic",
+               docname("C" * 50, longname) == docname("C" * 50, longname))
     check_true("day book request carried date range",
                any("20250401" in r for r in tally_requests))
 
@@ -314,6 +382,14 @@ def main() -> int:
     check("bad party_type rejected",
           "error" in mcp_server._outstanding("nonsense"), True)
     check("reconciliation healthy", mcp_server._unbalanced_vouchers()["healthy"], True)
+
+    comps = mcp_server._companies()
+    check("mcp lists company files", comps["count"], 2)
+    check_true("each company reports its own period",
+               all(c["first_voucher"] for c in comps["rows"]))
+    cmp_ = mcp_server._compare_ledger("Acme Traders & Co")
+    check("compare spans both years", cmp_["appears_in_companies"], 2)
+    check("year-on-year delta computed", cmp_["rows"][1]["change_vs_previous"], 48000.0)
     check("selftest passes", mcp_server.selftest(), 0)
 
     print("\nerror handling")
