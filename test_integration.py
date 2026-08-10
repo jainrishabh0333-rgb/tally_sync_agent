@@ -53,22 +53,36 @@ COMPANIES_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
  <COMPANY NAME="SN JAIN INDUSTRIES - (25-26)"><STARTINGFROM>20250401</STARTINGFROM></COMPANY>
 </COLLECTION></DATA></BODY></ENVELOPE>"""
 
+# Signs here follow TallyPrime's ACTUAL export convention: Debit is NEGATIVE,
+# Credit is POSITIVE. Acme is a customer filed under the sub-group "AGENT RK",
+# mirroring the real book where 92% of receivables sit below Sundry Debtors.
 LEDGERS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
  <LEDGER NAME="Acme Traders &amp; Co">
-  <PARENT>Sundry Debtors</PARENT><OPENINGBALANCE>50000.00</OPENINGBALANCE>
-  <CLOSINGBALANCE>168000.00</CLOSINGBALANCE><PARTYGSTIN>27AABCU9603R1ZM</PARTYGSTIN>
+  <PARENT>AGENT RK</PARENT><OPENINGBALANCE>-50000.00</OPENINGBALANCE>
+  <CLOSINGBALANCE>-168000.00</CLOSINGBALANCE><PARTYGSTIN>27AABCU9603R1ZM</PARTYGSTIN>
   <EMAIL>ap@acme.example</EMAIL><ISBILLWISEON>Yes</ISBILLWISEON>
   <MASTERID>77</MASTERID><ALTERID>1204</ALTERID>
  </LEDGER>
  <LEDGER NAME="M&amp;M Steel Suppliers">
-  <PARENT>Sundry Creditors</PARENT><OPENINGBALANCE>-20000.00</OPENINGBALANCE>
-  <CLOSINGBALANCE>-95000.00</CLOSINGBALANCE><ISBILLWISEON>Yes</ISBILLWISEON>
+  <PARENT>Stitchers</PARENT><OPENINGBALANCE>20000.00</OPENINGBALANCE>
+  <CLOSINGBALANCE>95000.00</CLOSINGBALANCE><ISBILLWISEON>Yes</ISBILLWISEON>
   <MASTERID>78</MASTERID><ALTERID>1205</ALTERID>
  </LEDGER>
  <LEDGER NAME="Sales Account">
-  <PARENT>Sales Accounts</PARENT><CLOSINGBALANCE>-100000.00</CLOSINGBALANCE>
+  <PARENT>Sales Accounts</PARENT><CLOSINGBALANCE>100000.00</CLOSINGBALANCE>
   <MASTERID>79</MASTERID><ALTERID>1206</ALTERID>
  </LEDGER>
+</COLLECTION></DATA></BODY></ENVELOPE>"""
+
+GROUPS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
+ <GROUP NAME="Sundry Debtors"><PARENT>Current Assets</PARENT></GROUP>
+ <GROUP NAME="Sundry Creditors"><PARENT>Current Liabilities</PARENT></GROUP>
+ <GROUP NAME="AGENT RK"><PARENT>Sundry Debtors</PARENT></GROUP>
+ <GROUP NAME="Stitchers"><PARENT>Sundry Creditors</PARENT></GROUP>
+ <GROUP NAME="Sales Accounts"><PARENT>Income</PARENT></GROUP>
+ <GROUP NAME="Current Assets"><PARENT>Primary</PARENT></GROUP>
+ <GROUP NAME="Current Liabilities"><PARENT>Primary</PARENT></GROUP>
+ <GROUP NAME="Income"><PARENT>Primary</PARENT></GROUP>
 </COLLECTION></DATA></BODY></ENVELOPE>"""
 
 
@@ -101,6 +115,8 @@ class TallyHandler(BaseHTTPRequestHandler):
 
         if "TB_Companies" in body:
             payload = COMPANIES_XML
+        elif "TB_Groups" in body:
+            payload = GROUPS_XML
         elif "TB_Ledgers" in body:
             payload = LEDGERS_XML
         elif "Day Book" in body:
@@ -265,11 +281,25 @@ def main() -> int:
     check_true("ampersand name parsed", "Acme Traders & Co" in by_name,
                f"got {list(by_name)}")
     acme = by_name["Acme Traders & Co"]
-    check("debtor group", acme.parent, "Sundry Debtors")
-    check("debtor closing balance", acme.closing_balance, 168000.0)
+    check("debtor sits under a sub-group", acme.parent, "AGENT RK")
+    check("debtor balance normalised to debit-positive",
+          acme.closing_balance, 168000.0)
     check("gstin", acme.gstin, "27AABCU9603R1ZM")
     check("bill-wise flag", acme.bill_by_bill, True)
-    check("creditor negative balance", by_name["M&M Steel Suppliers"].closing_balance, -95000.0)
+    check("creditor balance normalised to credit-negative",
+          by_name["M&M Steel Suppliers"].closing_balance, -95000.0)
+
+    print("\ngroup hierarchy resolution end-to-end")
+    from tally_client import fetch_groups, resolve_group_chain
+    groups = fetch_groups(tcfg)
+    check("group tree fetched", len(groups), 8)
+    gmap = {g.name: g for g in groups}
+    check("customer under AGENT RK resolves to Sundry Debtors",
+          resolve_group_chain("AGENT RK", gmap)[-1] if
+          "Sundry Debtors" not in resolve_group_chain("AGENT RK", gmap) else "Sundry Debtors",
+          "Sundry Debtors")
+    check_true("supplier under Stitchers resolves to Sundry Creditors",
+               "Sundry Creditors" in resolve_group_chain("Stitchers", gmap))
 
     print("\ntally read: vouchers")
     vouchers = fetch_vouchers(tcfg, date(2025, 4, 1), date(2025, 4, 30))
@@ -295,6 +325,17 @@ def main() -> int:
     pushed = store["ledgers"][0]
     check_true("ledger payload has name", "name" in pushed, f"keys={list(pushed)}")
     check_true("ledger payload has parent group", "parent" in pushed)
+    check_true("ledger payload carries resolved primary_group",
+               "primary_group" in pushed, f"keys={list(pushed)}")
+    acme_pushed = next(l for l in store["ledgers"] if l["name"] == "Acme Traders & Co")
+    check("sub-grouped customer is classified as a debtor",
+          acme_pushed["primary_group"], "Sundry Debtors")
+    check_true("group path recorded for auditing",
+               "Sundry Debtors" in (acme_pushed.get("group_path") or ""),
+               f"got {acme_pushed.get('group_path')!r}")
+    mm = next(l for l in store["ledgers"] if l["name"] == "M&M Steel Suppliers")
+    check("sub-grouped supplier is classified as a creditor",
+          mm["primary_group"], "Sundry Creditors")
     pv = store["vouchers"][0]
     check_true("voucher payload has guid", pv.get("guid") == "guid-0001")
     check_true("voucher payload nests entries",

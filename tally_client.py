@@ -106,6 +106,56 @@ def _fmt_date(d: date) -> str:
     return d.strftime("%Y%m%d")
 
 
+def _xml_escape(s: str) -> str:
+    """
+    Escape a value being interpolated INTO a request.
+
+    Company names really do contain ampersands ("S N Jain & Sons"), which would
+    otherwise produce a malformed request that Tally answers unhelpfully.
+    """
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def _company_tag(cfg: TallyConfig) -> str:
+    """
+    Render <SVCURRENTCOMPANY>, refusing to send an empty one.
+
+    An empty tag does not mean "the current company" — it silently resolves to
+    whatever is loaded, and a Collection request will happily return that
+    company's rows with STATUS=1 and no error. Since the agent labels rows from
+    config, that would file one company's ledgers under another company's name.
+    Failing loudly here is the only safe option.
+    """
+    if not cfg.company or not cfg.company.strip():
+        raise TallyError(
+            "No company specified. Refusing to query Tally without one, because "
+            "Tally would silently return whichever company happens to be loaded."
+        )
+    return f"<SVCURRENTCOMPANY>{_xml_escape(cfg.company)}</SVCURRENTCOMPANY>"
+
+
+def assert_company_loaded(cfg: TallyConfig) -> None:
+    """
+    Verify the requested company is actually open in Tally before reading it.
+
+    This is the guard against silent mis-binding: TallyPrime's Collection
+    requests do NOT fail when the named company is closed. They return the
+    loaded company's rows, or zero rows, with a success status either way.
+    Neither is distinguishable from a legitimate result, so the load state has
+    to be checked explicitly.
+    """
+    open_names = [c["name"] for c in list_companies(cfg)]
+    if cfg.company in open_names:
+        return
+    raise TallyError(
+        f"Company {cfg.company!r} is not open in Tally, so its data cannot be "
+        f"read safely.\nOpen in Tally right now: "
+        f"{', '.join(open_names) if open_names else '(none)'}\n"
+        "Open it in Tally (K: Company > Open) and run again."
+    )
+
+
 def _text(el: ET.Element | None) -> str:
     return (el.text or "").strip() if el is not None else ""
 
@@ -115,10 +165,20 @@ def _text(el: ET.Element | None) -> str:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class Group:
+    """An account group. Groups nest, so `parent` may itself be a group."""
+    name: str
+    parent: str = ""
+    primary_group: str = ""          # Tally's own root-group hint, when given
+
+
+@dataclass
 class Ledger:
     name: str
     company: str = ""                # which Tally company this belongs to
-    parent: str = ""                 # ledger group
+    parent: str = ""                 # immediate group, e.g. "AGENT RK"
+    primary_group: str = ""          # resolved root, e.g. "Sundry Debtors"
+    group_path: str = ""             # full chain, for auditing the resolution
     opening_balance: float = 0.0
     closing_balance: float = 0.0
     gstin: str = ""
@@ -142,7 +202,7 @@ def _ledgers_request(cfg: TallyConfig) -> str:
   <DESC>
    <STATICVARIABLES>
     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-    <SVCURRENTCOMPANY>{cfg.company}</SVCURRENTCOMPANY>
+    {_company_tag(cfg)}
    </STATICVARIABLES>
    <TDL><TDLMESSAGE>
     <COLLECTION NAME="TB_Ledgers" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
@@ -165,7 +225,16 @@ def _ledgers_request(cfg: TallyConfig) -> str:
 
 
 def _to_float(s: str) -> float:
-    """Tally amounts look like '-1,234.50' or '1234.50 Dr'. Normalise."""
+    """
+    Parse a raw Tally amount exactly as exported, e.g. '-1,234.50' or '1234.50 Dr'.
+
+    This is the RAW value. Tally's XML uses the opposite sign convention to
+    normal accounting: a Debit balance exports NEGATIVE and a Credit balance
+    exports POSITIVE. Verified against a live book, where Sundry Debtors
+    (Debit per Tally's own Group Summary) exported negative and Sundry
+    Creditors exported positive. Use `_to_debit_positive` for anything that
+    downstream code will reason about.
+    """
     if not s:
         return 0.0
     s = s.replace(",", "").strip()
@@ -182,8 +251,134 @@ def _to_float(s: str) -> float:
         return 0.0
 
 
+def _to_debit_positive(s: str) -> float:
+    """
+    Normalise a Tally balance to the standard convention: positive = Debit.
+
+    Tally exports Debit as negative, so this flips the sign. Everything stored
+    in Frappe and everything Claude sees uses debit-positive, which is what an
+    accountant expects: a customer who owes you money shows positive.
+    """
+    return -_to_float(s)
+
+
+def _groups_request(cfg: TallyConfig) -> str:
+    return f"""<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>TB_Groups</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    {_company_tag(cfg)}
+   </STATICVARIABLES>
+   <TDL><TDLMESSAGE>
+    <COLLECTION NAME="TB_Groups" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+     <TYPE>Group</TYPE>
+     <NATIVEMETHOD>Parent</NATIVEMETHOD>
+     <NATIVEMETHOD>_PrimaryGroup</NATIVEMETHOD>
+     <NATIVEMETHOD>IsRevenue</NATIVEMETHOD>
+     <NATIVEMETHOD>IsDeemedPositive</NATIVEMETHOD>
+    </COLLECTION>
+   </TDLMESSAGE></TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>"""
+
+
+def fetch_groups(cfg: TallyConfig) -> list[Group]:
+    """
+    Export the account-group tree.
+
+    Needed because real charts of accounts nest: this book files customers
+    under groups like "AGENT RK" and "Sundry Debtors Online", which are
+    themselves children of "Sundry Debtors". Classifying a ledger by its
+    immediate parent alone misses them — in this book that was 92% of
+    receivables.
+    """
+    assert_company_loaded(cfg)
+    raw = _post(cfg, _groups_request(cfg))
+    root = ET.fromstring(_clean_xml(raw))
+    groups: list[Group] = []
+    for el in root.iter("GROUP"):
+        name = el.get("NAME") or _text(el.find("NAME"))
+        if not name:
+            continue
+        groups.append(
+            Group(
+                name=name,
+                parent=_text(el.find("PARENT")),
+                primary_group=_text(el.find("_PRIMARYGROUP")),
+            )
+        )
+    log.info("Fetched %d groups", len(groups))
+    return groups
+
+
+# TallyPrime's 28 reserved groups. Every custom group ultimately descends from
+# one of these, so the nearest reserved ancestor is the level at which a ledger
+# is meaningfully classified — "Sundry Debtors" rather than "AGENT RK" below it
+# or "Primary" above it.
+TALLY_RESERVED_GROUPS = frozenset({
+    "Branch / Divisions", "Capital Account", "Current Assets", "Current Liabilities",
+    "Direct Expenses", "Direct Incomes", "Fixed Assets", "Indirect Expenses",
+    "Indirect Incomes", "Investments", "Loans (Liability)", "Misc. Expenses (ASSET)",
+    "Purchase Accounts", "Sales Accounts", "Suspense A/c", "Bank Accounts",
+    "Bank OD A/c", "Cash-in-Hand", "Deposits (Asset)", "Duties & Taxes",
+    "Loans & Advances (Asset)", "Provisions", "Reserves & Surplus", "Secured Loans",
+    "Stock-in-Hand", "Sundry Creditors", "Sundry Debtors", "Unsecured Loans",
+})
+
+
+def classify_group(chain: list[str]) -> str:
+    """
+    Pick the level at which a ledger should be reported, given its group chain.
+
+    Returns the nearest reserved-group ancestor. For a customer filed under
+    "AGENT RK", the chain is [AGENT RK, Sundry Debtors, Current Assets, Primary]
+    and this returns "Sundry Debtors" — specific enough to be useful, general
+    enough to aggregate. Falls back to the outermost group when nothing in the
+    chain is a reserved name, which happens only with a non-standard chart.
+    """
+    for name in chain:
+        if name in TALLY_RESERVED_GROUPS:
+            return name
+    return chain[-1] if chain else ""
+
+
+def resolve_group_chain(group_name: str, by_name: dict) -> list[str]:
+    """
+    Walk from a group up to its root, returning the chain nearest-first.
+
+    Tally guarantees no cycles, but a corrupt or partial export could still
+    loop, so this is defensive: it stops on a repeat and caps the depth.
+    """
+    chain: list[str] = []
+    seen = set()
+    cur = group_name
+    depth = 0
+    while cur and cur not in seen and depth < 32:
+        chain.append(cur)
+        seen.add(cur)
+        g = by_name.get(cur)
+        if not g:
+            break
+        # Tally's own hint short-circuits the walk when it is present.
+        if g.primary_group and g.primary_group not in seen:
+            chain.append(g.primary_group)
+            break
+        cur = g.parent
+        depth += 1
+    return chain
+
+
 def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
     """Export every ledger master with balances and party details."""
+    assert_company_loaded(cfg)
     raw = _post(cfg, _ledgers_request(cfg))
     root = ET.fromstring(_clean_xml(raw))
     ledgers: list[Ledger] = []
@@ -196,8 +391,9 @@ def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
                 name=name,
                 company=cfg.company,
                 parent=_text(el.find("PARENT")),
-                opening_balance=_to_float(_text(el.find("OPENINGBALANCE"))),
-                closing_balance=_to_float(_text(el.find("CLOSINGBALANCE"))),
+                # Normalised to debit-positive; Tally exports the opposite.
+                opening_balance=_to_debit_positive(_text(el.find("OPENINGBALANCE"))),
+                closing_balance=_to_debit_positive(_text(el.find("CLOSINGBALANCE"))),
                 gstin=_text(el.find("PARTYGSTIN")),
                 email=_text(el.find("EMAIL")),
                 phone=_text(el.find("LEDGERPHONE")),
@@ -207,7 +403,15 @@ def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
                 alter_id=_text(el.find("ALTERID")),
             )
         )
-    log.info("Fetched %d ledgers", len(ledgers))
+    if not ledgers:
+        # Zero rows is indistinguishable from a mis-bound request, so treat it
+        # as an error rather than mirroring an empty company over a real one.
+        raise TallyError(
+            f"Tally returned no ledgers for {cfg.company!r}. The company is "
+            "open but produced nothing, which usually means the logged-in "
+            "Tally user lacks permission to display Accounts Masters."
+        )
+    log.info("Fetched %d ledgers for %s", len(ledgers), cfg.company)
     return ledgers
 
 
@@ -218,7 +422,7 @@ def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
 @dataclass
 class VoucherEntry:
     ledger: str
-    amount: float                    # +ve = debit, -ve = credit (Tally sign)
+    amount: float                    # normalised: +ve = Debit, -ve = Credit
     is_debit: bool = False
 
 
@@ -251,7 +455,7 @@ def _daybook_request(cfg: TallyConfig, frm: date, to: date) -> str:
     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
     <SVFROMDATE>{_fmt_date(frm)}</SVFROMDATE>
     <SVTODATE>{_fmt_date(to)}</SVTODATE>
-    <SVCURRENTCOMPANY>{cfg.company}</SVCURRENTCOMPANY>
+    {_company_tag(cfg)}
    </STATICVARIABLES>
    <TDL><TDLMESSAGE>
     <REPORT NAME="Day Book" ISMODIFY="No"><FORMS>Day Book</FORMS></REPORT>
@@ -274,6 +478,7 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
     Export all vouchers in [frm, to] via the Day Book report.
     Chunk your date ranges (e.g. one month at a time) for large books.
     """
+    assert_company_loaded(cfg)
     raw = _post(cfg, _daybook_request(cfg, frm, to))
     root = ET.fromstring(_clean_xml(raw))
     vouchers: list[Voucher] = []
@@ -296,13 +501,17 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
         total_debit = 0.0
         for le in vel.iter("ALLLEDGERENTRIES.LIST"):
             ledger = _text(le.find("LEDGERNAME"))
-            amt = _to_float(_text(le.find("AMOUNT")))
-            is_debit = _text(le.find("ISDEEMEDPOSITIVE")).lower() == "yes"
             if not ledger:
                 continue
+            # ISDEEMEDPOSITIVE is Tally's own debit flag. Take direction from
+            # it and magnitude from |AMOUNT|, so the export's sign convention
+            # cannot invert anything downstream.
+            is_debit = _text(le.find("ISDEEMEDPOSITIVE")).lower() == "yes"
+            magnitude = abs(_to_float(_text(le.find("AMOUNT"))))
+            amt = magnitude if is_debit else -magnitude
             v.entries.append(VoucherEntry(ledger=ledger, amount=amt, is_debit=is_debit))
-            if amt > 0:
-                total_debit += amt
+            if is_debit:
+                total_debit += magnitude
         v.amount = round(total_debit, 2)
         vouchers.append(v)
 

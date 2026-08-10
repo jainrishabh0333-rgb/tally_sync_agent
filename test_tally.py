@@ -28,9 +28,12 @@ from pathlib import Path
 from tally_client import (
     TallyConfig,
     TallyError,
+    classify_group,
+    fetch_groups,
     fetch_ledgers,
     fetch_vouchers,
     list_companies,
+    resolve_group_chain,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -135,6 +138,16 @@ def main() -> int:
     # ---- 2. ledgers ------------------------------------------------------
     print()
     print("-" * 62)
+    print("Reading the group tree ...")
+    try:
+        groups = fetch_groups(cfg)
+    except TallyError as exc:
+        print(f"  FAILED: {exc}")
+        return 1
+    by_name = {g.name: g for g in groups}
+    print(f"  OK - {len(groups)} groups.")
+
+    print()
     print("Reading ledger masters ...")
     try:
         ledgers = fetch_ledgers(cfg)
@@ -142,33 +155,62 @@ def main() -> int:
         print(f"  FAILED: {exc}")
         return 1
 
+    # Classify each ledger by its nearest reserved ancestor, not its immediate
+    # parent - custom sub-groups are where most balances actually live.
+    for l in ledgers:
+        chain = resolve_group_chain(l.parent, by_name) if l.parent else []
+        l.primary_group = classify_group(chain) if chain else l.parent
+        l.group_path = " > ".join(reversed(chain)) if chain else l.parent
+
     if not ledgers:
         print("  No ledgers returned. Usually means the company name does not match.")
         return 1
 
     print(f"  OK - {len(ledgers)} ledgers.")
 
-    groups: dict[str, int] = {}
+    rolled: dict[str, int] = {}
     for l in ledgers:
-        groups[l.parent or "(no group)"] = groups.get(l.parent or "(no group)", 0) + 1
+        key = l.primary_group or "(no group)"
+        rolled[key] = rolled.get(key, 0) + 1
     print()
-    print("  Largest groups:")
-    for g, n in sorted(groups.items(), key=lambda kv: -kv[1])[:8]:
+    print("  Ledgers by reporting group (sub-groups rolled up):")
+    for g, n in sorted(rolled.items(), key=lambda kv: -kv[1])[:10]:
         print(f"    {n:5d}  {g}")
 
-    debtors = [l for l in ledgers if l.parent == "Sundry Debtors"]
-    creditors = [l for l in ledgers if l.parent == "Sundry Creditors"]
+    debtors = [l for l in ledgers if l.primary_group == "Sundry Debtors"]
+    creditors = [l for l in ledgers if l.primary_group == "Sundry Creditors"]
+    d_direct = sum(1 for l in debtors if l.parent == "Sundry Debtors")
+    c_direct = sum(1 for l in creditors if l.parent == "Sundry Creditors")
+
     print()
-    print(f"  Sundry Debtors   : {len(debtors):5d} ledgers, "
-          f"net {money(sum(l.closing_balance for l in debtors))}")
-    print(f"  Sundry Creditors : {len(creditors):5d} ledgers, "
-          f"net {money(sum(l.closing_balance for l in creditors))}")
+    print("  Balances are shown debit-positive, matching Tally's Group Summary.")
+    print("  COMPARE THESE AGAINST TALLY:")
+    d_dr = sum(l.closing_balance for l in debtors if l.closing_balance > 0)
+    d_cr = -sum(l.closing_balance for l in debtors if l.closing_balance < 0)
+    c_dr = sum(l.closing_balance for l in creditors if l.closing_balance > 0)
+    c_cr = -sum(l.closing_balance for l in creditors if l.closing_balance < 0)
+    print(f"    Sundry Debtors    {len(debtors):5d} ledgers "
+          f"({d_direct} direct, {len(debtors) - d_direct} via sub-groups)")
+    print(f"        Debit {money(d_dr):>20}    Credit {money(d_cr):>18}")
+    print(f"    Sundry Creditors  {len(creditors):5d} ledgers "
+          f"({c_direct} direct, {len(creditors) - c_direct} via sub-groups)")
+    print(f"        Debit {money(c_dr):>20}    Credit {money(c_cr):>18}")
+
+    subs = {}
+    for l in debtors:
+        if l.parent != "Sundry Debtors":
+            subs[l.parent] = subs.get(l.parent, 0.0) + l.closing_balance
+    if subs:
+        print()
+        print("  Debtor sub-groups (these would be MISSED without group resolution):")
+        for g, tot in sorted(subs.items(), key=lambda kv: -abs(kv[1]))[:8]:
+            print(f"    {money(tot):>20}  {g}")
 
     if debtors:
         print()
-        print("  Top 5 debtor balances (check these against Tally):")
+        print("  Top 5 debtor balances (positive = they owe you):")
         for l in sorted(debtors, key=lambda x: -abs(x.closing_balance))[:5]:
-            print(f"    {money(l.closing_balance):>18}  {l.name[:40]}")
+            print(f"    {money(l.closing_balance):>20}  {l.name[:38]}")
 
     with_gstin = sum(1 for l in ledgers if l.gstin)
     print()

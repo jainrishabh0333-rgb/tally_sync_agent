@@ -11,7 +11,10 @@ import sys
 import xml.etree.ElementTree as ET
 from datetime import date
 
-from tally_client import _clean_xml, _to_float, _tally_date_to_iso
+from tally_client import (
+    Group, TallyConfig, TallyError, _clean_xml, _company_tag, _to_float,
+    _to_debit_positive, _tally_date_to_iso, _xml_escape, resolve_group_chain,
+)
 import sync
 
 failures: list[str] = []
@@ -134,6 +137,67 @@ check("group", lel.findtext("PARENT"), "Sundry Debtors")
 check("gstin", lel.findtext("PARTYGSTIN"), "27AABCU9603R1ZM")
 check("bill-wise flag", lel.findtext("ISBILLWISEON").lower() == "yes", True)
 check("closing balance", _to_float(lel.findtext("CLOSINGBALANCE")), -168000.00)
+
+print("\nsign convention (verified against a live book, 2026-08-10)")
+# TallyPrime exports Debit as NEGATIVE. Confirmed twice against Tally's own
+# Group Summary for SN JAIN INDUSTRIES PVT LTD - (26-27):
+#   V MART RETAIL LTD-HARYANA     Tally: Debit  1,20,08,830.20  XML: -1,20,08,830.20
+#   SETH JI HOSIERY LLP-(Sale)    Tally: Credit   23,87,383.92  XML: +23,87,383.92
+check("V Mart: debit balance becomes positive",
+      _to_debit_positive("-12008830.20"), 12008830.20)
+check("Seth Ji: credit balance becomes negative",
+      _to_debit_positive("2387383.92"), -2387383.92)
+check("raw parse is left untouched for auditing",
+      _to_float("-12008830.20"), -12008830.20)
+check("zero stays zero", _to_debit_positive("0"), 0.0)
+check_true = check  # keep the helper name used below
+check("debtors group net flips to positive (was -1,69,90,673.98)",
+      round(_to_debit_positive("-16990673.98"), 2), 16990673.98)
+check("creditors group net flips to negative (was +10,11,16,657.28)",
+      round(_to_debit_positive("101116657.28"), 2), -101116657.28)
+
+print("\ngroup hierarchy resolution (this book's real structure)")
+# Sundry Debtors > AGENT RK > <customer ledgers>, and Sundry Debtors Online.
+GROUPS = {g.name: g for g in [
+    Group("Sundry Debtors", "Current Assets"),
+    Group("Current Assets", "Primary"),
+    Group("AGENT RK", "Sundry Debtors"),
+    Group("AGENT JAISON", "Sundry Debtors"),
+    Group("Sundry Debtors Online", "Sundry Debtors"),
+    Group("Sundry Creditors", "Current Liabilities"),
+    Group("Current Liabilities", "Primary"),
+    Group("Stitchers", "Sundry Creditors"),
+    Group("Transporter", "Sundry Creditors"),
+]}
+chain = resolve_group_chain("AGENT RK", GROUPS)
+check("AGENT RK resolves up through Sundry Debtors",
+      "Sundry Debtors" in chain, True)
+check("Stitchers resolves up through Sundry Creditors",
+      "Sundry Creditors" in resolve_group_chain("Stitchers", GROUPS), True)
+check("a top-level group resolves to itself",
+      resolve_group_chain("Sundry Debtors", GROUPS)[0], "Sundry Debtors")
+check("unknown group degrades gracefully",
+      resolve_group_chain("MYSTERY GROUP", GROUPS), ["MYSTERY GROUP"])
+# A corrupt export must not hang the agent.
+CYCLE = {g.name: g for g in [Group("A", "B"), Group("B", "C"), Group("C", "A")]}
+cyc = resolve_group_chain("A", CYCLE)
+check("a cyclic group tree terminates", len(cyc) <= 3, True)
+
+print("\ncompany mis-binding guards")
+try:
+    _company_tag(TallyConfig(company=""))
+    check("empty company is refused", "no error raised", "TallyError")
+except TallyError:
+    check("empty company is refused", True, True)
+try:
+    _company_tag(TallyConfig(company="   "))
+    check("whitespace-only company is refused", "no error", "TallyError")
+except TallyError:
+    check("whitespace-only company is refused", True, True)
+check("company name is xml-escaped in the request",
+      _company_tag(TallyConfig(company="S N Jain & Sons")),
+      "<SVCURRENTCOMPANY>S N Jain &amp; Sons</SVCURRENTCOMPANY>")
+check("angle brackets escaped too", _xml_escape("<x>"), "&lt;x&gt;")
 
 print()
 if failures:

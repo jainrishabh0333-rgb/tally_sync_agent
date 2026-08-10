@@ -32,9 +32,12 @@ from frappe_client import FrappeClient, FrappeConfig, FrappeError
 from tally_client import (
     TallyConfig,
     TallyError,
+    fetch_groups,
     fetch_ledgers,
     fetch_vouchers,
     list_companies,
+    classify_group,
+    resolve_group_chain,
 )
 
 try:  # Python 3.11+ has tomllib; fall back to tomli if present.
@@ -185,10 +188,33 @@ def date_chunks(frm: date, to: date, days: int):
 
 def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     log.info("Syncing ledger masters...")
+
+    # Groups first: real charts of accounts nest customers under sub-groups
+    # (e.g. "AGENT RK" under "Sundry Debtors"), and classifying by immediate
+    # parent alone would miss them.
+    groups = fetch_groups(st.tally)
+    by_name = {g.name: g for g in groups}
+
     ledgers = fetch_ledgers(st.tally)
     if not ledgers:
         log.warning("No ledgers returned — check the company name in config.")
         return 0
+
+    for l in ledgers:
+        chain = resolve_group_chain(l.parent, by_name) if l.parent else []
+        l.group_path = " > ".join(reversed(chain)) if chain else l.parent
+        l.primary_group = classify_group(chain) if chain else l.parent
+
+    resolved = sum(1 for l in ledgers if l.primary_group != l.parent)
+    log.info("Resolved %d/%d ledgers to a reserved group above their own",
+             resolved, len(ledgers))
+    for grp in ("Sundry Debtors", "Sundry Creditors"):
+        n = sum(1 for l in ledgers if l.primary_group == grp)
+        direct = sum(1 for l in ledgers if l.parent == grp)
+        if n > direct:
+            log.info("  %s: %d ledgers (%d directly, %d via sub-groups)",
+                     grp, n, direct, n - direct)
+
     payload = [dataclasses.asdict(l) for l in ledgers]
     # Push in batches so a huge chart of accounts doesn't blow the request size.
     pushed = 0
