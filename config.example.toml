@@ -1,0 +1,26 @@
+# Copy to config.toml and fill in. config.toml is gitignored — it holds secrets.
+
+[tally]
+# Where TallyPrime is running. If the agent runs ON the Tally machine, leave
+# host as "localhost". Otherwise use that machine's LAN IP, e.g. "192.168.1.7".
+host = "localhost"
+port = 9000
+# EXACT company name as it appears in Tally (run `python sync.py --check` to list).
+company = "SN JAIN INDUSTRIES"
+timeout = 120
+
+[frappe]
+# Your Frappe Cloud site, no trailing slash.
+url = "https://yourcompany.frappe.cloud"
+# Generate under: Frappe desk > user > Settings > API Access > Generate Keys
+api_key = "xxxxxxxxxxxxxxx"
+api_secret = "xxxxxxxxxxxxxxx"
+
+[sync]
+# Vouchers are exported in date chunks so large books don't time out.
+chunk_days = 31
+# On each incremental run, re-pull this many days before the last synced date,
+# so back-dated entries and edits are caught.
+overlap_days = 7
+# Financial year start month (4 = April, Indian FY).
+fy_start_month = 4

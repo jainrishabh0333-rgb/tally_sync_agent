@@ -1,0 +1,17 @@
+# Secrets - never commit
+config.toml
+.env
+
+# Logs
+*.log
+sync.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
