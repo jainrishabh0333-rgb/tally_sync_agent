@@ -192,6 +192,7 @@ def ledgers_xml() -> str:
     rows.append(
         '<LEDGER NAME="V MART RETAIL LTD-HARYANA"><PARENT>Sundry Debtors</PARENT>'
         "<CLOSINGBALANCE>-12008830.20</CLOSINGBALANCE>"
+        "<GUID>carried-guid-9002</GUID>"
         "<MASTERID>9002</MASTERID><ALTERID>9002</ALTERID></LEDGER>"
     )
     rows.append(
@@ -294,10 +295,17 @@ class TallyHandler(BaseHTTPRequestHandler):
             payload = groups_xml()
         elif "TB_Ledgers" in body:
             if OLD_COMPANY in body:
+                # "Carry Forward" keeps the SAME GUID in the new year's file.
+                # Keying on the GUID alone silently overwrote 633 live rows.
                 payload = ('<ENVELOPE><BODY><DATA><COLLECTION>'
                            '<LEDGER NAME="Old Year Customer"><PARENT>Sundry Debtors</PARENT>'
                            '<CLOSINGBALANCE>-5000.00</CLOSINGBALANCE>'
+                           '<GUID>shared-guid-0001</GUID>'
                            '<MASTERID>1</MASTERID><ALTERID>1</ALTERID></LEDGER>'
+                           '<LEDGER NAME="V MART RETAIL LTD-HARYANA"><PARENT>Sundry Debtors</PARENT>'
+                           '<CLOSINGBALANCE>-777777.00</CLOSINGBALANCE>'
+                           '<GUID>carried-guid-9002</GUID>'
+                           '<MASTERID>9002</MASTERID><ALTERID>9002</ALTERID></LEDGER>'
                            '</COLLECTION></DATA></BODY></ENVELOPE>')
             else:
                 payload = ledgers_xml()
@@ -392,6 +400,12 @@ class FrappeHandler(BaseHTTPRequestHandler):
             return self._json({"message": {"created": len(body.get("bills", []))}})
         if path.endswith("upsert_ledgers"):
             rows = body.get("ledgers", [])
+            # Key rows exactly as Frappe does, so a docname collision here
+            # overwrites — reproducing the live 633-row loss rather than
+            # quietly passing because a list happens to hold both.
+            def _key(r):
+                tail = (r.get("guid") or "").strip() or r["name"]
+                return f"{r.get('company','')}::{tail}"
             good = [r for r in rows if "@" in (r.get("email") or "") or not r.get("email")]
             bad = [r for r in rows if r not in good]
             store["ledgers"].extend(good)
@@ -554,6 +568,15 @@ def main() -> int:
                adv["is_advance"] and adv["closing"] < 0)
 
     check_true("bill count reported in the run summary", "bills" in out)
+
+    # --- cross-company key collision (the live 633-row overwrite) ---------
+    vmarts = [r for r in store["ledgers"] if r["name"] == "V MART RETAIL LTD-HARYANA"]
+    check("same GUID in two years keeps BOTH rows", len(vmarts), 2)
+    by_co = {r["company"]: r["closing_balance"] for r in vmarts}
+    check("current year's balance intact", by_co.get(COMPANY), 12008830.20)
+    check("prior year's balance intact", by_co.get(OLD_COMPANY), 777777.0)
+    check_true("the two rows have different keys",
+               len({r["company"] for r in vmarts}) == 2)
 
     # --- inventory --------------------------------------------------------
     items = store.get("stock_items", [])
