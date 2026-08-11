@@ -201,20 +201,31 @@ class TallyHandler(BaseHTTPRequestHandler):
                        + _voucher("stuck-day-guid", "RC/001", "20260810",
                                   "Customer 0001", "40000.00", "same day every time")
                        + "</TALLYMESSAGE></DATA></BODY></ENVELOPE>")
-        elif "Voucher Register" in body:
-            # This shape honours the range.
+        elif "TB_VchAll" in body:
+            # The guaranteed fallback: everything, unscoped. The agent filters.
+            payload = (vouchers_xml("old", "20240415") if OLD_COMPANY in body
+                       else vouchers_xml("apr", "20260415"))
+        elif "TB_Vouchers" in body:
+            # Emulate a CORRECT Tally: honour the TDL filter, but only if the
+            # request is well formed. A malformed one (plural <FILTERS>, or
+            # multiple <FETCH> tags) returns everything unfiltered — exactly
+            # how the live server behaved.
             import re as _re
-            m = _re.search(r'SVFROMDATE[^>]*>(\d{8})<', body)
-            m2 = _re.search(r'SVTODATE[^>]*>(\d{8})<', body)
-            frm_s = m.group(1) if m else ""
-            to_s = m2.group(1) if m2 else ""
-            def _covers(day): return frm_s <= day <= to_s
-            if OLD_COMPANY in body:
-                payload = (vouchers_xml("old", "20240415") if _covers("20240415") else
-                           "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
+            well_formed = (bool(_re.search(r"<FILTER>[^<]+</FILTER>", body))
+                           and body.count("<FETCH>") == 1)
+            lits = _re.findall(r'\$\$Date:"(\d{8})"', body)
+            if not well_formed or len(lits) != 2:
+                # Unfiltered: every voucher, both companies' worth.
+                payload = vouchers_xml("leak", "20260415")
             else:
-                payload = (vouchers_xml("apr") if _covers("20260415")
-                           else "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
+                frm_s, to_s = lits
+                def _covers(day): return frm_s <= day <= to_s
+                if OLD_COMPANY in body:
+                    payload = (vouchers_xml("old", "20240415") if _covers("20240415") else
+                               "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
+                else:
+                    payload = (vouchers_xml("apr", "20260415") if _covers("20260415")
+                               else "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
         else:
             payload = "<ENVELOPE></ENVELOPE>"
         raw = payload.encode("utf-8")
@@ -385,8 +396,9 @@ def main() -> int:
                "DASHBOARD, not your site" not in out)
 
     # The Day Book range defect was detected and routed around.
-    check_true("range-ignoring Day Book detected by the probe",
-               "ignores date ranges" in out)
+    check_true("probe verified the request against two real months",
+               "verified against two" in out, out[-400:])
+    check_true("the TDL-filtered request was chosen", "using 'filter'" in out)
     check_true("the stuck same-day voucher never entered the mirror",
                not any(v.get("guid") == "stuck-day-guid" for v in store["vouchers"]))
 

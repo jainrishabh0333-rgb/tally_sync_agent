@@ -20,7 +20,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import requests
@@ -320,6 +320,14 @@ def _parse_xml(raw: str) -> ET.Element:
 def _fmt_date(d: date) -> str:
     """Tally wants dates as YYYYMMDD."""
     return d.strftime("%Y%m%d")
+
+
+def _tally_date_to_iso(s: str) -> str:
+    """Tally voucher dates come back as YYYYMMDD; normalise to ISO."""
+    s = (s or "").strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s
 
 
 def _xml_escape(s: str) -> str:
@@ -659,117 +667,192 @@ class Voucher:
 
 def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str:
     """
-    Build a voucher export for one of three request shapes.
+    Build a voucher export in one of several shapes.
 
-    TallyPrime builds differ in which shape actually honours SVFROMDATE /
-    SVTODATE — the live server served the SAME day's voucher for every
-    monthly window, so the range was being ignored entirely. The working
-    shape is detected at runtime by _pick_voucher_variant.
+    TallyPrime builds disagree about which export honours SVFROMDATE/SVTODATE.
+    On this server the Day Book report ignored them entirely and answered every
+    monthly window with the current day's data — five identical vouchers filed
+    as five different months. The working shape is detected at runtime by
+    _pick_voucher_variant, which verifies rather than assumes.
     """
-    dates = (f'<SVFROMDATE TYPE="Date">{_fmt_date(frm)}</SVFROMDATE>'
-             f'<SVTODATE TYPE="Date">{_fmt_date(to)}</SVTODATE>')
-    if variant in ("daybook", "register"):
-        report = "Day Book" if variant == "daybook" else "Voucher Register"
+    fd, td = _fmt_date(frm), _fmt_date(to)
+
+    if variant in ("daybook", "daybook_typed", "register"):
+        report = "Voucher Register" if variant == "register" else "Day Book"
+        attr = ' TYPE="Date"' if variant == "daybook_typed" else ""
         return f"""<ENVELOPE>
- <HEADER>
-  <VERSION>1</VERSION>
-  <TALLYREQUEST>Export</TALLYREQUEST>
-  <TYPE>Data</TYPE>
-  <ID>{report}</ID>
- </HEADER>
- <BODY>
-  <DESC>
-   <STATICVARIABLES>
-    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-    {dates}
-    {_company_tag(cfg)}
-   </STATICVARIABLES>
-   <TDL><TDLMESSAGE>
-    <REPORT NAME="{report}" ISMODIFY="No"><FORMS>{report}</FORMS></REPORT>
-   </TDLMESSAGE></TDL>
-  </DESC>
- </BODY>
-</ENVELOPE>"""
-    # variant == "collection": a Voucher collection honours the SV dates in
-    # the TDL spec itself, at the cost of listing fields explicitly.
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Data</TYPE><ID>{report}</ID></HEADER>
+ <BODY><DESC><STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   <SVFROMDATE{attr}>{fd}</SVFROMDATE><SVTODATE{attr}>{td}</SVTODATE>
+   {_company_tag(cfg)}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <REPORT NAME="{report}" ISMODIFY="No"><FORMS>{report}</FORMS></REPORT>
+  </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
+
+    if variant == "filter":
+        # Verified against the most widely deployed Tally extractor
+        # (tally-database-loader, src/tally.mts:506 and 1104-1124).
+        #
+        # Three things here are load-bearing and were each wrong before:
+        #   * <FILTER> is SINGULAR and comma-joined. <FILTERS> is silently
+        #     ignored, which is exactly how an unfiltered result came back.
+        #   * ONE <FETCH>, comma-joined. The multi-tag form belongs to
+        #     <FETCHLIST> at DESC level — a different construct.
+        #   * NO SVFROMDATE/SVTODATE. A Collection has no report context, so
+        #     they bind to nothing; the FILTER is the only scoping mechanism.
+        #
+        # The comparison operators must reach Tally as the entity sequences
+        # below — this is ordinary XML escaping of < and > inside element
+        # text. Never pass this formula through _xml_escape(): doing so would
+        # double-escape it and the filter would silently mis-evaluate.
+        cond = (f'$Date &gt;= $$Date:"{fd}" and $Date &lt;= $$Date:"{td}"')
+        return f"""<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE><ID>TB_Vouchers</ID></HEADER>
+ <BODY><DESC><STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   {_company_tag(cfg)}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="TB_Vouchers" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+    <TYPE>Voucher</TYPE>
+    <FETCH>Guid,Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate,Narration,PartyLedgerName,IsInvoice,IsCancelled,AlterID,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive</FETCH>
+    <FILTER>TBFltrPeriod,TBFltrNotCancelled,TBFltrNotOptional</FILTER>
+   </COLLECTION>
+   <SYSTEM TYPE="Formulae" NAME="TBFltrPeriod">{cond}</SYSTEM>
+   <SYSTEM TYPE="Formulae" NAME="TBFltrNotCancelled">NOT $IsCancelled</SYSTEM>
+   <SYSTEM TYPE="Formulae" NAME="TBFltrNotOptional">NOT $IsOptional</SYSTEM>
+  </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
+
+    # variant == "all": no date scoping at all. Used as the guaranteed
+    # fallback — fetch the company once, then filter in Python. Slower and
+    # heavier, but it cannot be defeated by a build that ignores ranges.
     return f"""<ENVELOPE>
- <HEADER>
-  <VERSION>1</VERSION>
-  <TALLYREQUEST>Export</TALLYREQUEST>
-  <TYPE>Collection</TYPE>
-  <ID>TB_Vouchers</ID>
- </HEADER>
- <BODY>
-  <DESC>
-   <STATICVARIABLES>
-    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-    {dates}
-    {_company_tag(cfg)}
-   </STATICVARIABLES>
-   <TDL><TDLMESSAGE>
-    <COLLECTION NAME="TB_Vouchers" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
-     <TYPE>Voucher</TYPE>
-     <NATIVEMETHOD>Date</NATIVEMETHOD>
-     <NATIVEMETHOD>Guid</NATIVEMETHOD>
-     <NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD>
-     <NATIVEMETHOD>VoucherNumber</NATIVEMETHOD>
-     <NATIVEMETHOD>PartyLedgerName</NATIVEMETHOD>
-     <NATIVEMETHOD>Narration</NATIVEMETHOD>
-     <NATIVEMETHOD>IsCancelled</NATIVEMETHOD>
-     <NATIVEMETHOD>AlterId</NATIVEMETHOD>
-     <NATIVEMETHOD>AllLedgerEntries</NATIVEMETHOD>
-    </COLLECTION>
-   </TDLMESSAGE></TDL>
-  </DESC>
- </BODY>
-</ENVELOPE>"""
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE><ID>TB_VchAll</ID></HEADER>
+ <BODY><DESC><STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   {_company_tag(cfg)}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="TB_VchAll" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+    <TYPE>Voucher</TYPE>
+    <FETCH>Guid,Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate,Narration,PartyLedgerName,IsInvoice,IsCancelled,AlterID,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive</FETCH>
+    <FILTER>TBFltrNotCancelled,TBFltrNotOptional</FILTER>
+   </COLLECTION>
+   <SYSTEM TYPE="Formulae" NAME="TBFltrNotCancelled">NOT $IsCancelled</SYSTEM>
+   <SYSTEM TYPE="Formulae" NAME="TBFltrNotOptional">NOT $IsOptional</SYSTEM>
+  </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
 
 
-# Probe result cache: one detection per Tally endpoint per process.
+# Probe result and whole-company cache, keyed per Tally endpoint + company.
 _variant_cache: dict = {}
+_all_cache: dict = {}
+
+# Ordered best-first: precise and cheap before broad and heavy.
+_VARIANTS = ("filter", "daybook", "daybook_typed", "register")
+
+
+def _company_start(cfg: TallyConfig) -> "date | None":
+    """The first date this company's books cover, per Tally itself."""
+    try:
+        for c in list_companies(cfg):
+            if c["name"] == cfg.company:
+                iso = _tally_date_to_iso(c.get("starting_from") or "")
+                if len(iso) == 10:
+                    return date.fromisoformat(iso)
+    except (TallyError, ValueError):
+        pass
+    return None
+
+
+def _probe_variant(cfg: TallyConfig, variant: str) -> str:
+    """
+    Classify one variant by EXPERIMENT: 'works', 'ignores', 'empty', 'error'.
+
+    Two different real windows are requested and their results compared. A
+    request that honours dates returns different vouchers for different
+    months; one that ignores them returns the same rows both times — which is
+    precisely the failure that filed one Receipt under five months.
+
+    An absurd window (1901) is deliberately NOT used: Tally clamps requests to
+    the company's own book period, so an empty answer there proves nothing.
+    """
+    # Windows must sit INSIDE this company's own book period — a file for
+    # 2024-25 holds nothing in 2026, and probing there would prove nothing.
+    start = _company_start(cfg) or date(date.today().year, 4, 1)
+    windows = [(start, start + timedelta(days=29)),
+               (start + timedelta(days=90), start + timedelta(days=119))]
+    seen = []
+    for frm, to in windows:
+        try:
+            root = _parse_xml(_post(cfg, _voucher_request(cfg, frm, to, variant)))
+        except TallyError:
+            return "error"
+        guids, out_of_range = set(), 0
+        for vel in root.iter("VOUCHER"):
+            g = _text(vel.find("GUID"))
+            d = _tally_date_to_iso(_text(vel.find("DATE")))
+            if g:
+                guids.add(g)
+            if d and not (str(frm) <= d <= str(to)):
+                out_of_range += 1
+        if out_of_range:
+            return "ignores"          # returned rows outside the window asked for
+        seen.append(guids)
+
+    if not seen[0] and not seen[1]:
+        return "empty"                # nothing in either window
+    if seen[0] and seen[0] == seen[1]:
+        return "ignores"              # identical rows for two different months
+    return "works"
 
 
 def _pick_voucher_variant(cfg: TallyConfig) -> str:
     """
-    Detect which request shape this Tally build uses to honour date ranges.
+    Choose how to fetch vouchers from THIS Tally, verifying by experiment.
 
-    The probe asks each variant for vouchers from 1901. A build that honours
-    ranges returns nothing; a build that ignores them returns today's data —
-    which on the live server is exactly how months of history silently never
-    arrived. The first variant that passes wins and is cached.
+    Tries each request shape in order and keeps the first that demonstrably
+    honours a date window. If none does, falls back to fetching the whole
+    company once and filtering here — slower, but it cannot be defeated by a
+    build that ignores ranges, so the mirror is correct either way.
     """
-    key = cfg.url
+    key = (cfg.url, cfg.company)
     if key in _variant_cache:
         return _variant_cache[key]
-    ancient_frm, ancient_to = date(1901, 1, 1), date(1901, 1, 2)
-    for variant in ("daybook", "register", "collection"):
-        try:
-            raw = _post(cfg, _voucher_request(cfg, ancient_frm, ancient_to, variant))
-            root = _parse_xml(raw)
-            leaked = sum(1 for _ in root.iter("VOUCHER"))
-        except TallyError:
-            continue
-        if leaked == 0:
-            if variant != "daybook":
-                log.warning("This Tally build ignores date ranges on the Day "
-                            "Book export; using the '%s' request instead.", variant)
+
+    for variant in _VARIANTS:
+        verdict = _probe_variant(cfg, variant)
+        if verdict == "works":
+            log.info("Voucher requests: using %r (verified against two "
+                     "different months).", variant)
             _variant_cache[key] = variant
             return variant
-        log.warning("Probe: '%s' returned %d voucher(s) for a range in 1901 — "
-                    "it ignores date ranges, trying the next shape.", variant, leaked)
-    raise TallyError(
-        "Every voucher request shape ignores date ranges on this TallyPrime "
-        "build — syncing would fetch the same day's data for every window. "
-        "Please report the TallyPrime version shown in Help > About."
+        log.info("Voucher request %r: %s — trying the next shape.",
+                 variant, verdict)
+
+    log.warning(
+        "No voucher request on this Tally build honours date ranges. Falling "
+        "back to fetching the whole company once and filtering by date here — "
+        "slower and heavier, but the result is correct either way."
     )
+    _variant_cache[key] = "all"
+    return "all"
 
 
-def _tally_date_to_iso(s: str) -> str:
-    """Tally voucher dates come as YYYYMMDD."""
-    s = s.strip()
-    if len(s) == 8 and s.isdigit():
-        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
-    return s
+def _fetch_all_once(cfg: TallyConfig) -> str:
+    """Fetch (and cache for this run) every voucher in the current company."""
+    key = (cfg.url, cfg.company)
+    if key not in _all_cache:
+        log.info("Fetching the complete voucher list for %s (one-off, may take "
+                 "a few minutes)...", cfg.company)
+        _all_cache[key] = _post(cfg, _voucher_request(cfg, date(1900, 1, 1),
+                                                      date(2100, 1, 1), "all"))
+        log.info("  received %.1f MB", len(_all_cache[key]) / 1_048_576)
+    return _all_cache[key]
 
 
 def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
@@ -783,7 +866,8 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
     """
     assert_company_loaded(cfg)
     variant = _pick_voucher_variant(cfg)
-    raw = _post(cfg, _voucher_request(cfg, frm, to, variant))
+    raw = _fetch_all_once(cfg) if variant == "all" else _post(
+        cfg, _voucher_request(cfg, frm, to, variant))
     root = _parse_xml(raw)
     vouchers: list[Voucher] = []
     out_of_range = 0

@@ -119,6 +119,16 @@ class TallyHandler(BaseHTTPRequestHandler):
             payload = GROUPS_XML
         elif "TB_Ledgers" in body:
             payload = LEDGERS_XML
+        elif "TB_Vouchers" in body or "TB_VchAll" in body:
+            import re as _re
+            lits = _re.findall(r'\$\$Date:"(\d{8})"', body)
+            if len(lits) == 2 and not ("20250401" >= lits[0] and "20250401" <= lits[1]):
+                payload = "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>"
+            else:
+                payload = ("<ENVELOPE><BODY><DATA><TALLYMESSAGE>"
+                           + _voucher("guid-0001", "SL/0001", "20250415", "Acme Traders &amp; Co", "118000.00")
+                           + _voucher("guid-0002", "SL/0002", "20250420", "Acme Traders &amp; Co", "59000.00")
+                           + "</TALLYMESSAGE></DATA></BODY></ENVELOPE>")
         elif "Day Book" in body:
             # Return vouchers only for the chunk covering April 2025.
             if "20250401" in body or "202504" in body:
@@ -230,6 +240,8 @@ class FrappeHandler(BaseHTTPRequestHandler):
             return self._json({"message": {"count": 2, "total_value": 177000.0, "rows": []}})
         if path.endswith("unbalanced_vouchers"):
             return self._json({"message": {"count": 0, "healthy": True, "rows": []}})
+        if path.endswith("recent_failures"):
+            return self._json({"message": {"count": 0, "rows": []}})
         if path.endswith("companies"):
             return self._json({"message": {"count": 2, "rows": [
                 {"company": "SN JAIN INDUSTRIES - (24-25)", "voucher_count": 2,
