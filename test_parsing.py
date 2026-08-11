@@ -28,6 +28,14 @@ def check(label: str, got, want):
         print(f"  ok    {label}")
 
 
+def check_true(label: str, cond, hint: str = ""):
+    if not cond:
+        failures.append(f"{label} {hint}".strip())
+        print(f"  FAIL  {label} {hint}".rstrip())
+    else:
+        print(f"  ok    {label}")
+
+
 print("amount parsing")
 check("plain", _to_float("1234.50"), 1234.50)
 check("commas", _to_float("1,23,456.78"), 123456.78)
@@ -150,7 +158,6 @@ check("Seth Ji: credit balance becomes negative",
 check("raw parse is left untouched for auditing",
       _to_float("-12008830.20"), -12008830.20)
 check("zero stays zero", _to_debit_positive("0"), 0.0)
-check_true = check  # keep the helper name used below
 check("debtors group net flips to positive (was -1,69,90,673.98)",
       round(_to_debit_positive("-16990673.98"), 2), 16990673.98)
 check("creditors group net flips to negative (was +10,11,16,657.28)",
@@ -198,6 +205,37 @@ check("company name is xml-escaped in the request",
       _company_tag(TallyConfig(company="S N Jain & Sons")),
       "<SVCURRENTCOMPANY>S N Jain &amp; Sons</SVCURRENTCOMPANY>")
 check("angle brackets escaped too", _xml_escape("<x>"), "&lt;x&gt;")
+
+print("\ncommand-line arguments (guards against args.X with no add_argument)")
+import ast, inspect, re
+parser = sync.build_parser()
+defined = {a.dest for a in parser._actions}
+
+# Every `args.<name>` that main() reads must exist on the parser, or the tool
+# dies with AttributeError only when that code path is first taken - which for
+# --full meant it shipped broken.
+src = inspect.getsource(sync.main)
+used = set(re.findall(r"\bargs\.([a-zA-Z_][a-zA-Z0-9_]*)", src))
+missing = sorted(used - defined)
+check("every args.X used by main() is defined", missing, [])
+expected = {"check", "full", "frm", "to", "company", "config", "verbose",
+            "ledgers_only", "vouchers_only"}
+check_true("parser defines every documented flag", expected <= defined,
+           f"missing: {sorted(expected - defined)}")
+
+# Each documented invocation must actually parse.
+for argv in ([], ["--check"], ["--full"], ["--ledgers-only"], ["--vouchers-only"],
+             ["--company", "SN JAIN INDUSTRIES PVT LTD - (26-27)"],
+             ["--from", "2025-04-01", "--to", "2025-06-30"], ["-v"]):
+    try:
+        ns = parser.parse_args(argv)
+        for name in used:
+            getattr(ns, name)          # would raise if undefined
+        check_true(f"parses {' '.join(argv) or '(no args)'}", True)
+    except SystemExit:
+        check_true(f"parses {' '.join(argv) or '(no args)'}", False, "argparse rejected it")
+    except AttributeError as exc:
+        check_true(f"parses {' '.join(argv) or '(no args)'}", False, str(exc))
 
 print()
 if failures:

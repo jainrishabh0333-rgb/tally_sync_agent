@@ -377,7 +377,8 @@ def check(st: Settings) -> int:
     return 0 if ok else 1
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Separate from main() so tests can check it against what main() reads."""
     p = argparse.ArgumentParser(description="Sync TallyPrime data into Frappe.")
     p.add_argument("--check", action="store_true", help="test connectivity and exit")
     p.add_argument("--full", action="store_true", help="sync from start of financial year")
@@ -385,9 +386,16 @@ def main() -> int:
     p.add_argument("--to", dest="to", metavar="YYYY-MM-DD")
     p.add_argument("--ledgers-only", action="store_true")
     p.add_argument("--vouchers-only", action="store_true")
+    p.add_argument("--company", metavar="NAME", default=None,
+                   help="sync only this company, ignoring config.toml. "
+                        "The name must match Tally exactly.")
     p.add_argument("--config", type=Path, default=None)
     p.add_argument("-v", "--verbose", action="store_true")
-    args = p.parse_args()
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
