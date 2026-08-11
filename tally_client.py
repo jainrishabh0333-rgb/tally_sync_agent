@@ -657,28 +657,111 @@ class Voucher:
     entries: list[VoucherEntry] = field(default_factory=list)
 
 
-def _daybook_request(cfg: TallyConfig, frm: date, to: date) -> str:
-    return f"""<ENVELOPE>
+def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str:
+    """
+    Build a voucher export for one of three request shapes.
+
+    TallyPrime builds differ in which shape actually honours SVFROMDATE /
+    SVTODATE — the live server served the SAME day's voucher for every
+    monthly window, so the range was being ignored entirely. The working
+    shape is detected at runtime by _pick_voucher_variant.
+    """
+    dates = (f'<SVFROMDATE TYPE="Date">{_fmt_date(frm)}</SVFROMDATE>'
+             f'<SVTODATE TYPE="Date">{_fmt_date(to)}</SVTODATE>')
+    if variant in ("daybook", "register"):
+        report = "Day Book" if variant == "daybook" else "Voucher Register"
+        return f"""<ENVELOPE>
  <HEADER>
   <VERSION>1</VERSION>
   <TALLYREQUEST>Export</TALLYREQUEST>
   <TYPE>Data</TYPE>
-  <ID>Day Book</ID>
+  <ID>{report}</ID>
  </HEADER>
  <BODY>
   <DESC>
    <STATICVARIABLES>
     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
-    <SVFROMDATE>{_fmt_date(frm)}</SVFROMDATE>
-    <SVTODATE>{_fmt_date(to)}</SVTODATE>
+    {dates}
     {_company_tag(cfg)}
    </STATICVARIABLES>
    <TDL><TDLMESSAGE>
-    <REPORT NAME="Day Book" ISMODIFY="No"><FORMS>Day Book</FORMS></REPORT>
+    <REPORT NAME="{report}" ISMODIFY="No"><FORMS>{report}</FORMS></REPORT>
    </TDLMESSAGE></TDL>
   </DESC>
  </BODY>
 </ENVELOPE>"""
+    # variant == "collection": a Voucher collection honours the SV dates in
+    # the TDL spec itself, at the cost of listing fields explicitly.
+    return f"""<ENVELOPE>
+ <HEADER>
+  <VERSION>1</VERSION>
+  <TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE>
+  <ID>TB_Vouchers</ID>
+ </HEADER>
+ <BODY>
+  <DESC>
+   <STATICVARIABLES>
+    <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    {dates}
+    {_company_tag(cfg)}
+   </STATICVARIABLES>
+   <TDL><TDLMESSAGE>
+    <COLLECTION NAME="TB_Vouchers" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+     <TYPE>Voucher</TYPE>
+     <NATIVEMETHOD>Date</NATIVEMETHOD>
+     <NATIVEMETHOD>Guid</NATIVEMETHOD>
+     <NATIVEMETHOD>VoucherTypeName</NATIVEMETHOD>
+     <NATIVEMETHOD>VoucherNumber</NATIVEMETHOD>
+     <NATIVEMETHOD>PartyLedgerName</NATIVEMETHOD>
+     <NATIVEMETHOD>Narration</NATIVEMETHOD>
+     <NATIVEMETHOD>IsCancelled</NATIVEMETHOD>
+     <NATIVEMETHOD>AlterId</NATIVEMETHOD>
+     <NATIVEMETHOD>AllLedgerEntries</NATIVEMETHOD>
+    </COLLECTION>
+   </TDLMESSAGE></TDL>
+  </DESC>
+ </BODY>
+</ENVELOPE>"""
+
+
+# Probe result cache: one detection per Tally endpoint per process.
+_variant_cache: dict = {}
+
+
+def _pick_voucher_variant(cfg: TallyConfig) -> str:
+    """
+    Detect which request shape this Tally build uses to honour date ranges.
+
+    The probe asks each variant for vouchers from 1901. A build that honours
+    ranges returns nothing; a build that ignores them returns today's data —
+    which on the live server is exactly how months of history silently never
+    arrived. The first variant that passes wins and is cached.
+    """
+    key = cfg.url
+    if key in _variant_cache:
+        return _variant_cache[key]
+    ancient_frm, ancient_to = date(1901, 1, 1), date(1901, 1, 2)
+    for variant in ("daybook", "register", "collection"):
+        try:
+            raw = _post(cfg, _voucher_request(cfg, ancient_frm, ancient_to, variant))
+            root = _parse_xml(raw)
+            leaked = sum(1 for _ in root.iter("VOUCHER"))
+        except TallyError:
+            continue
+        if leaked == 0:
+            if variant != "daybook":
+                log.warning("This Tally build ignores date ranges on the Day "
+                            "Book export; using the '%s' request instead.", variant)
+            _variant_cache[key] = variant
+            return variant
+        log.warning("Probe: '%s' returned %d voucher(s) for a range in 1901 — "
+                    "it ignores date ranges, trying the next shape.", variant, leaked)
+    raise TallyError(
+        "Every voucher request shape ignores date ranges on this TallyPrime "
+        "build — syncing would fetch the same day's data for every window. "
+        "Please report the TallyPrime version shown in Help > About."
+    )
 
 
 def _tally_date_to_iso(s: str) -> str:
@@ -691,13 +774,19 @@ def _tally_date_to_iso(s: str) -> str:
 
 def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
     """
-    Export all vouchers in [frm, to] via the Day Book report.
-    Chunk your date ranges (e.g. one month at a time) for large books.
+    Export all vouchers in [frm, to].
+
+    The request shape is picked by _pick_voucher_variant, because TallyPrime
+    builds differ in which export actually honours SVFROMDATE/SVTODATE — the
+    live server ignored them on the Day Book report entirely. Chunk your date
+    ranges (e.g. one month at a time) for large books.
     """
     assert_company_loaded(cfg)
-    raw = _post(cfg, _daybook_request(cfg, frm, to))
+    variant = _pick_voucher_variant(cfg)
+    raw = _post(cfg, _voucher_request(cfg, frm, to, variant))
     root = _parse_xml(raw)
     vouchers: list[Voucher] = []
+    out_of_range = 0
 
     for vel in root.iter("VOUCHER"):
         guid = _text(vel.find("GUID"))
@@ -729,8 +818,23 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
             if is_debit:
                 total_debit += magnitude
         v.amount = round(total_debit, 2)
+
+        # Belt and braces: even a range-honouring variant must never smuggle
+        # in rows from outside the window — mislabelled periods are worse
+        # than missing ones.
+        try:
+            v_date = date.fromisoformat(v.date)
+        except ValueError:
+            v_date = None
+        if v_date is not None and not (frm <= v_date <= to):
+            out_of_range += 1
+            continue
         vouchers.append(v)
 
+    if out_of_range:
+        log.warning("Dropped %d voucher(s) dated outside %s..%s — this Tally "
+                    "build leaks rows across range boundaries.",
+                    out_of_range, frm, to)
     log.info("Fetched %d vouchers for %s..%s", len(vouchers), frm, to)
     return vouchers
 

@@ -144,7 +144,7 @@ def _voucher(guid, num, day, party, amount, narration):
     )
 
 
-def vouchers_xml(chunk_key: str) -> str:
+def vouchers_xml(chunk_key: str, day: str = "20260415") -> str:
     """Every narration pathology the live book demonstrated, all at once."""
     hostile = [
         # control bytes after multi-byte text (byte-col != char-col)
@@ -164,7 +164,7 @@ def vouchers_xml(chunk_key: str) -> str:
         "flagged <ok> by accounts",
     ]
     vs = "".join(
-        _voucher(f"{chunk_key}-g{i}", f"SL/{i:03d}", "20260415",
+        _voucher(f"{chunk_key}-g{i}", f"SL/{i:03d}", day,
                  f"Customer {i:04d}", f"{(i + 1) * 118}.00", hostile[i % len(hostile)])
         for i in range(60)
     )
@@ -194,13 +194,26 @@ class TallyHandler(BaseHTTPRequestHandler):
             else:
                 payload = ledgers_xml()
         elif "Day Book" in body:
+            # Emulate the LIVE defect: Day Book ignores SVFROMDATE/SVTODATE
+            # and always returns the same single "today" voucher — exactly
+            # what served one Receipt for every monthly window on 2026-08-11.
+            payload = ("<ENVELOPE><BODY><DATA><TALLYMESSAGE>"
+                       + _voucher("stuck-day-guid", "RC/001", "20260810",
+                                  "Customer 0001", "40000.00", "same day every time")
+                       + "</TALLYMESSAGE></DATA></BODY></ENVELOPE>")
+        elif "Voucher Register" in body:
+            # This shape honours the range.
+            import re as _re
+            m = _re.search(r'SVFROMDATE[^>]*>(\d{8})<', body)
+            m2 = _re.search(r'SVTODATE[^>]*>(\d{8})<', body)
+            frm_s = m.group(1) if m else ""
+            to_s = m2.group(1) if m2 else ""
+            def _covers(day): return frm_s <= day <= to_s
             if OLD_COMPANY in body:
-                # Prior-year vouchers exist ONLY in April 2024. If the agent
-                # floors the range at the current FY, it never requests this.
-                payload = (vouchers_xml("old") if "20240401" in body else
+                payload = (vouchers_xml("old", "20240415") if _covers("20240415") else
                            "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
             else:
-                payload = (vouchers_xml("apr") if "20260401" in body
+                payload = (vouchers_xml("apr") if _covers("20260415")
                            else "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
         else:
             payload = "<ENVELOPE></ENVELOPE>"
@@ -370,6 +383,12 @@ def main() -> int:
                "temporarily unavailable" not in out and proc.returncode == 0)
     check_true("dashboard hint NOT shown for the 502",
                "DASHBOARD, not your site" not in out)
+
+    # The Day Book range defect was detected and routed around.
+    check_true("range-ignoring Day Book detected by the probe",
+               "ignores date ranges" in out)
+    check_true("the stuck same-day voucher never entered the mirror",
+               not any(v.get("guid") == "stuck-day-guid" for v in store["vouchers"]))
 
     # Sync log written with Success.
     check_true("sync log recorded", len(store["logs"]) >= 1)
