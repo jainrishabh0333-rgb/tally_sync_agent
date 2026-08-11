@@ -86,6 +86,17 @@ _INVALID_XML_CHARS = re.compile(
 _NUMERIC_REF = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+);")
 _VALID_NUMERIC = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+)$")
 
+# What may legitimately sit between '<' and '>' in Tally's export: an element
+# name (letters, digits, dots, colons, hyphens, underscores — ALLLEDGERENTRIES.LIST,
+# UDF:_UDF_FIELD), optionally attributes with double-quoted values, optional
+# self-close. Anything else is narration text wearing angle brackets.
+_TAG_SHAPE = re.compile(
+    r"^/?[A-Za-z_][\w.:-]*"                       # element name
+    r"(\s+[A-Za-z_][\w.:-]*\s*=\s*\"[^\"<]*\")*"   # attributes; '>' may occur in a value
+    r"\s*/?$"
+    r"|^[!?].*$"                                   # <?xml ...?>, <!-- -->
+)
+
 
 def _drop_invalid_refs(m: "re.Match[str]") -> str:
     """Keep a numeric character reference only if it names a legal XML char."""
@@ -122,13 +133,22 @@ def _clean_xml(raw: str) -> str:
             else:
                 out.append("&amp;")
         elif ch == "<":
-            # A '<' that cannot start a tag is text, e.g. a narration
-            # "rate < 500". Escape it; leave real tags alone.
-            nxt = raw[i + 1] if i + 1 < n else ""
-            if nxt.isalpha() or nxt in "/!?":
-                out.append(ch)
-            else:
-                out.append("&lt;")
+            # Keep '<' only when what follows is a genuinely well-formed tag.
+            # Narrations contain things like "rate < 500", "<- pending" and
+            # "<PONO 123>" — the last LOOKS tag-like but has an attribute
+            # starting with a digit, which no repair-by-character can fix.
+            # An attribute value may itself contain '>' (a ledger named
+            # "A > B"), so try successive candidate closers before giving up.
+            kept = False
+            close = raw.find(">", i + 1, i + 300)
+            for _ in range(5):
+                if close == -1:
+                    break
+                if _TAG_SHAPE.match(raw[i + 1:close]):
+                    kept = True
+                    break
+                close = raw.find(">", close + 1, i + 300)
+            out.append(ch if kept else "&lt;")
         else:
             out.append(ch)
         i += 1
@@ -145,22 +165,45 @@ def _parse_xml(raw: str) -> ET.Element:
     day's voucher export to one byte is not.
     """
     text = _clean_xml(raw)
+    repairs = 0
+    last_pos = None
     for _ in range(200):
         try:
-            return ET.fromstring(text)
+            root = ET.fromstring(text)
+            if repairs:
+                log.warning("Repaired %d invalid character(s) in Tally's XML "
+                            "response; the affected narration text lost those "
+                            "characters, everything else is intact.", repairs)
+            return root
         except ET.ParseError as exc:
             lineno, col = getattr(exc, "position", (None, None))
             if lineno is None:
                 raise
             lines = text.split("\n")
-            if not (1 <= lineno <= len(lines)) or col >= len(lines[lineno - 1]):
+            if not (1 <= lineno <= len(lines)):
                 raise
-            bad = lines[lineno - 1][col]
-            log.warning("Replacing invalid XML character %r at line %d col %d",
-                        bad, lineno, col)
-            lines[lineno - 1] = (
-                lines[lineno - 1][:col] + "?" + lines[lineno - 1][col + 1:]
-            )
+            line = lines[lineno - 1]
+
+            # expat counts columns in UTF-8 BYTES; the string is indexed in
+            # characters. On a line holding multi-byte text those differ, and
+            # editing at the byte column mutilates an innocent character while
+            # the real offender survives — the loop then spins in place.
+            char_idx = len(line.encode("utf-8")[:col].decode("utf-8", "ignore"))
+            if char_idx >= len(line):
+                raise
+
+            # Deleting (not substituting) guarantees the text shrinks, so the
+            # loop must terminate even when the parser keeps blaming the same
+            # spot. A substituted placeholder can itself be blamed, forever.
+            if last_pos == (lineno, col, len(line)):
+                char_idx = max(0, char_idx - 1)   # blamed char unchanged? widen
+            last_pos = (lineno, col, len(line))
+
+            if repairs < 5:
+                log.warning("Removing invalid XML character %r at line %d",
+                            line[char_idx], lineno)
+            repairs += 1
+            lines[lineno - 1] = line[:char_idx] + line[char_idx + 1:]
             text = "\n".join(lines)
     raise TallyError(
         "Tally's XML response could not be repaired after 200 attempts — "
