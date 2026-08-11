@@ -334,14 +334,31 @@ def check(st: Settings) -> int:
         companies = list_companies(st.tally)
         print(f"  OK — Tally reachable at {st.tally.url}")
         if companies:
-            print("  Open companies:")
-            for c in companies:
-                mark = " <-- configured" if c["name"] == st.tally.company else ""
-                print(f"    - {c['name']}{mark}")
             names = [c["name"] for c in companies]
-            if st.tally.company not in names:
-                print(f"  WARNING: configured company '{st.tally.company}' is not open in Tally.")
-                ok = False
+            # An empty `companies` list in config means "sync everything open",
+            # so report what will actually be synced rather than checking a
+            # single configured name that may deliberately be unset.
+            wanted = st.companies or names
+            print(f"  Open in Tally ({len(names)}):")
+            for n in names:
+                print(f"    - {n}{'  <-- will sync' if n in wanted else ''}")
+
+            missing = [w for w in wanted if w not in names]
+            if missing:
+                print()
+                print(f"  WARNING: {len(missing)} configured compan"
+                      f"{'y is' if len(missing) == 1 else 'ies are'} NOT open, so "
+                      f"{'it' if len(missing) == 1 else 'they'} will be skipped:")
+                for m in missing:
+                    print(f"    - {m}")
+                print("  Open them in Tally (K: Company > Open) to include them.")
+            if not st.companies:
+                print()
+                print(f"  config.toml lists no companies, so all {len(names)} open "
+                      "will be synced.")
+                if len(names) < 2:
+                    print("  Open the other financial years in Tally first if you "
+                          "want them included.")
         else:
             print("  WARNING: no companies reported. Is a company loaded in Tally?")
             ok = False
