@@ -166,8 +166,21 @@ class FrappeHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
         if path.endswith("upsert_ledgers"):
-            store["ledgers"].extend(body.get("ledgers", []))
-            return self._json({"message": {"created": len(body.get("ledgers", []))}})
+            rows = body.get("ledgers", [])
+            # Mimic Frappe's real behaviour: reject rows whose email is not an
+            # address (a live book had "hariomsilkmills.com"), accept the rest.
+            good = [l for l in rows if "@" in (l.get("email") or "") or not l.get("email")]
+            bad = [l for l in rows if l not in good]
+            store["ledgers"].extend(good)
+            out = {"created": len(good)}
+            if bad:
+                out["failed"] = len(bad)
+                out["errors"] = [
+                    {"ledger": l["name"], "company": l.get("company", ""),
+                     "error": f"InvalidEmailAddressError: {l['email']} is not a valid Email Address"}
+                    for l in bad
+                ]
+            return self._json({"message": out})
         if path.endswith("upsert_vouchers"):
             store["vouchers"].extend(body.get("vouchers", []))
             return self._json({"message": {"created": len(body.get("vouchers", []))}})
@@ -396,6 +409,31 @@ def main() -> int:
                docname("C" * 50, longname) == docname("C" * 50, longname))
     check_true("day book request carried date range",
                any("20250401" in r for r in tally_requests))
+
+    print("\none bad row must not discard the batch")
+    store["ledgers"].clear()
+    st.tally.company = "SN JAIN INDUSTRIES - (25-26)"
+    import tally_client as _tc
+    _real = _tc.fetch_ledgers
+    def _with_a_bad_row(cfg):
+        rows = _real(cfg)
+        rows[1].email = "hariomsilkmills.com"   # a domain, not an address
+        return rows
+    _tc.fetch_ledgers = _with_a_bad_row
+    sync.fetch_ledgers = _with_a_bad_row
+    try:
+        pushed = sync.sync_ledgers(st, fc)
+    finally:
+        _tc.fetch_ledgers = _real
+        sync.fetch_ledgers = _real
+
+    check("good rows still mirrored despite the bad one", len(store["ledgers"]), 2)
+    check("count returned excludes the rejected row", pushed, 2)
+    check_true("the rejected ledger is absent",
+               all(l["name"] != "M&M Steel Suppliers" for l in store["ledgers"]))
+    check_true("the surviving rows are the expected ones",
+               {l["name"] for l in store["ledgers"]} == {"Acme Traders & Co", "Sales Account"},
+               f"got {{l['name'] for l in store['ledgers']}}")
 
     print("\nsync logging")
     fc.log_sync("Success", {"ledgers": 3, "vouchers": 2, "seconds": 1.2})

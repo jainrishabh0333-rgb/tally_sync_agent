@@ -240,6 +240,29 @@ def date_chunks(frm: date, to: date, days: int):
 # Sync steps
 # ---------------------------------------------------------------------------
 
+def _report_rejects(msg, kind: str) -> int:
+    """
+    Log any rows Frappe refused, and return how many.
+
+    Frappe validates on the way in, and a real chart of accounts contains
+    values it dislikes — an email field holding a bare domain, for instance.
+    Those rows are skipped rather than failing the batch, but they must be
+    visible: a silently short mirror is worse than a noisy one.
+    """
+    if not isinstance(msg, dict):
+        return 0
+    errs = msg.get("errors") or []
+    if not errs:
+        return 0
+    log.warning("%d %s(s) rejected by Frappe:", len(errs), kind)
+    for e in errs[:10]:
+        label = e.get("ledger") or e.get("voucher") or "?"
+        log.warning("    %-45s %s", label[:45], e.get("error", "")[:120])
+    if len(errs) > 10:
+        log.warning("    ... and %d more", len(errs) - 10)
+    return int(msg.get("failed") or len(errs))
+
+
 def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     log.info("Syncing ledger masters...")
 
@@ -272,12 +295,18 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     payload = [dataclasses.asdict(l) for l in ledgers]
     # Push in batches so a huge chart of accounts doesn't blow the request size.
     pushed = 0
+    rejected = 0
     for i in range(0, len(payload), 500):
         batch = payload[i:i + 500]
-        fc.upsert_ledgers(batch)
+        res = fc.upsert_ledgers(batch) or {}
+        msg = res.get("message", res) if isinstance(res, dict) else {}
+        rejected += _report_rejects(msg, "ledger")
         pushed += len(batch)
         log.info("  ledgers %d/%d", pushed, len(payload))
-    return pushed
+    if rejected:
+        log.warning("%d ledger(s) were rejected by Frappe and NOT mirrored "
+                    "(details above). The rest synced normally.", rejected)
+    return pushed - rejected
 
 
 def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date) -> int:
@@ -289,10 +318,14 @@ def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date) -> int:
             log.info("  %s..%s: none", c_from, c_to)
             continue
         payload = [dataclasses.asdict(v) for v in vouchers]
+        rejected = 0
         for i in range(0, len(payload), 200):
-            fc.upsert_vouchers(payload[i:i + 200])
-        total += len(payload)
-        log.info("  %s..%s: %d vouchers", c_from, c_to, len(payload))
+            res = fc.upsert_vouchers(payload[i:i + 200]) or {}
+            msg = res.get("message", res) if isinstance(res, dict) else {}
+            rejected += _report_rejects(msg, "voucher")
+        total += len(payload) - rejected
+        log.info("  %s..%s: %d vouchers%s", c_from, c_to, len(payload) - rejected,
+                 f" ({rejected} rejected)" if rejected else "")
     return total
 
 
