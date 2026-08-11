@@ -17,6 +17,7 @@ requests, so it can never modify your books. Tally stays the master.
 from __future__ import annotations
 
 import logging
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date
@@ -75,30 +76,97 @@ def _post(cfg: TallyConfig, xml_body: str) -> str:
     return text
 
 
+# Characters XML 1.0 forbids outright: C0 controls except tab/newline/CR,
+# plus a few oddities. Voucher narrations accumulate these — people paste
+# text into Tally from anywhere — and one such byte kills the whole parse.
+_INVALID_XML_CHARS = re.compile(
+    "[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD"
+    "\U00010000-\U0010FFFF]"
+)
+_NUMERIC_REF = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+);")
+_VALID_NUMERIC = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+)$")
+
+
+def _drop_invalid_refs(m: "re.Match[str]") -> str:
+    """Keep a numeric character reference only if it names a legal XML char."""
+    v = m.group(1)
+    code = int(v[1:], 16) if v[0] in "xX" else int(v)
+    if code in (0x9, 0xA, 0xD) or 0x20 <= code <= 0xD7FF \
+            or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF:
+        return m.group(0)
+    return ""
+
+
 def _clean_xml(raw: str) -> str:
     """
-    Tally emits invalid XML: raw '&' characters and control bytes that break
-    strict parsers. Sanitise before handing to ElementTree.
+    Tally's XML export is not well-formed XML. Observed in live books:
+    raw control bytes in narrations, invalid numeric references like &#4;,
+    unescaped ampersands, and unescaped '<' in text ("qty < 100").
+    Sanitise all of it before handing to ElementTree.
     """
-    raw = raw.replace("&#4;", "").replace("\x04", "")
-    # Escape stray ampersands that are not part of a valid entity.
+    raw = _INVALID_XML_CHARS.sub("", raw)
+    raw = _NUMERIC_REF.sub(_drop_invalid_refs, raw)
+
     out: list[str] = []
     i = 0
     n = len(raw)
     while i < n:
         ch = raw[i]
         if ch == "&":
-            # Look ahead for a valid entity terminator ';' within 8 chars.
+            # Keep only well-formed entities; escape every other ampersand.
             semi = raw.find(";", i, i + 8)
             token = raw[i:semi] if semi != -1 else ""
-            if token in ("&amp", "&lt", "&gt", "&quot", "&apos") or token.startswith("&#"):
+            if token in ("&amp", "&lt", "&gt", "&quot", "&apos") \
+                    or (token.startswith("&#") and _VALID_NUMERIC.match(token)):
                 out.append(ch)
             else:
                 out.append("&amp;")
+        elif ch == "<":
+            # A '<' that cannot start a tag is text, e.g. a narration
+            # "rate < 500". Escape it; leave real tags alone.
+            nxt = raw[i + 1] if i + 1 < n else ""
+            if nxt.isalpha() or nxt in "/!?":
+                out.append(ch)
+            else:
+                out.append("&lt;")
         else:
             out.append(ch)
         i += 1
     return "".join(out)
+
+
+def _parse_xml(raw: str) -> ET.Element:
+    """
+    Parse Tally's response, surviving garbage _clean_xml didn't anticipate.
+
+    If parsing still fails, the offending character (ElementTree reports its
+    exact position) is replaced and the parse retried, up to a bounded number
+    of times. Losing a character of a narration is acceptable; losing a whole
+    day's voucher export to one byte is not.
+    """
+    text = _clean_xml(raw)
+    for _ in range(200):
+        try:
+            return ET.fromstring(text)
+        except ET.ParseError as exc:
+            lineno, col = getattr(exc, "position", (None, None))
+            if lineno is None:
+                raise
+            lines = text.split("\n")
+            if not (1 <= lineno <= len(lines)) or col >= len(lines[lineno - 1]):
+                raise
+            bad = lines[lineno - 1][col]
+            log.warning("Replacing invalid XML character %r at line %d col %d",
+                        bad, lineno, col)
+            lines[lineno - 1] = (
+                lines[lineno - 1][:col] + "?" + lines[lineno - 1][col + 1:]
+            )
+            text = "\n".join(lines)
+    raise TallyError(
+        "Tally's XML response could not be repaired after 200 attempts — "
+        "the export appears badly corrupted. Re-run with -v and report the "
+        "date range being fetched."
+    )
 
 
 def _fmt_date(d: date) -> str:
@@ -302,7 +370,7 @@ def fetch_groups(cfg: TallyConfig) -> list[Group]:
     """
     assert_company_loaded(cfg)
     raw = _post(cfg, _groups_request(cfg))
-    root = ET.fromstring(_clean_xml(raw))
+    root = _parse_xml(raw)
     groups: list[Group] = []
     for el in root.iter("GROUP"):
         name = el.get("NAME") or _text(el.find("NAME"))
@@ -380,7 +448,7 @@ def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
     """Export every ledger master with balances and party details."""
     assert_company_loaded(cfg)
     raw = _post(cfg, _ledgers_request(cfg))
-    root = ET.fromstring(_clean_xml(raw))
+    root = _parse_xml(raw)
     ledgers: list[Ledger] = []
     for el in root.iter("LEDGER"):
         name = el.get("NAME") or _text(el.find("NAME"))
@@ -480,7 +548,7 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
     """
     assert_company_loaded(cfg)
     raw = _post(cfg, _daybook_request(cfg, frm, to))
-    root = ET.fromstring(_clean_xml(raw))
+    root = _parse_xml(raw)
     vouchers: list[Voucher] = []
 
     for vel in root.iter("VOUCHER"):
@@ -533,7 +601,7 @@ def list_companies(cfg: TallyConfig) -> list[dict[str, Any]]:
     <NATIVEMETHOD>Name</NATIVEMETHOD><NATIVEMETHOD>StartingFrom</NATIVEMETHOD></COLLECTION>
   </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
     raw = _post(cfg, req)
-    root = ET.fromstring(_clean_xml(raw))
+    root = _parse_xml(raw)
     companies = []
     for el in root.iter("COMPANY"):
         name = el.get("NAME") or _text(el.find("NAME"))

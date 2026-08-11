@@ -146,6 +146,43 @@ check("gstin", lel.findtext("PARTYGSTIN"), "27AABCU9603R1ZM")
 check("bill-wise flag", lel.findtext("ISBILLWISEON").lower() == "yes", True)
 check("closing balance", _to_float(lel.findtext("CLOSINGBALANCE")), -168000.00)
 
+print("\nhostile XML from real voucher narrations (live failure 2026-08-11)")
+from tally_client import _parse_xml
+
+# The live Day Book export died at line 2083 col 20 on an invalid token.
+# Reproduce every class of garbage narrations are known to carry.
+hostile = ("<ENVELOPE><BODY><DATA><TALLYMESSAGE>"
+           "<VOUCHER><GUID>g1</GUID>"
+           "<NARRATION>ctrl\x04byte\x1bescape\x00null</NARRATION>"
+           "<PARTYLEDGERNAME>M&M Traders</PARTYLEDGERNAME>"
+           "</VOUCHER>"
+           "<VOUCHER><GUID>g2</GUID>"
+           "<NARRATION>bad refs &#4; &#0; &#27; &#x1B; kept: &#65; &#x41;</NARRATION>"
+           "<PARTYLEDGERNAME>rate < 500 per pc</PARTYLEDGERNAME>"
+           "</VOUCHER>"
+           "<VOUCHER><GUID>g3</GUID>"
+           "<NARRATION>trailing amp & and <- arrow</NARRATION>"
+           "</VOUCHER>"
+           "</TALLYMESSAGE></DATA></BODY></ENVELOPE>")
+
+root = _parse_xml(hostile)
+vs = list(root.iter("VOUCHER"))
+check("all vouchers survive hostile narrations", len(vs), 3)
+check("control bytes stripped", vs[0].findtext("NARRATION"), "ctrlbyteescapenull")
+check("ampersand in party name preserved", vs[0].findtext("PARTYLEDGERNAME"), "M&M Traders")
+check("invalid numeric refs dropped, valid kept",
+      vs[1].findtext("NARRATION"), "bad refs     kept: A A")
+check("unescaped < in text survives", vs[1].findtext("PARTYLEDGERNAME"), "rate < 500 per pc")
+check("trailing & and <- arrow survive", vs[2].findtext("NARRATION"), "trailing amp & and <- arrow")
+
+# Backstop: garbage even _clean_xml cannot anticipate is repaired char-by-char.
+weird = "<A><B>ok</B><C>x\ud800y</C></A>"   # lone surrogate
+try:
+    r2 = _parse_xml(weird)
+    check("lone surrogate repaired by backstop", r2.findtext("B"), "ok")
+except Exception as e:
+    check("lone surrogate repaired by backstop", f"raised {type(e).__name__}", "no exception")
+
 print("\nsign convention (verified against a live book, 2026-08-10)")
 # TallyPrime exports Debit as NEGATIVE. Confirmed twice against Tally's own
 # Group Summary for SN JAIN INDUSTRIES PVT LTD - (26-27):
