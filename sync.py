@@ -117,6 +117,20 @@ def load_settings(path: Path | None = None) -> Settings:
             f"\nCreate {cfg_path} from config.example.toml, or set env vars."
         )
 
+    # The control panel is not the site. Pointing at it returns the Frappe
+    # Cloud dashboard's HTML for every request, which is confusing to debug.
+    host = frappe.url.lower()
+    for wrong in ("frappecloud.com", "cloud.frappe.io", "frappe.io"):
+        if wrong in host:
+            sys.exit(
+                f"frappe.url is set to {frappe.url!r}, which is the Frappe Cloud\n"
+                "control panel, not your site. Use your own site address, the one\n"
+                "you log in to, e.g.:\n"
+                '    url = "https://yoursite.frappe.cloud"'
+            )
+    if not host.startswith(("http://", "https://")):
+        sys.exit(f"frappe.url must start with https:// — got {frappe.url!r}")
+
     return Settings(
         tally=tally,
         frappe=frappe,
