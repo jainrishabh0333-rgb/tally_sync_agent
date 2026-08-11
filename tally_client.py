@@ -1160,7 +1160,7 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
    <REPORT NAME="{report}" ISMODIFY="No"><FORMS>{report}</FORMS></REPORT>
   </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
 
-    if variant == "filter":
+    if variant.startswith("filter"):
         # Verified against the most widely deployed Tally extractor
         # (tally-database-loader, src/tally.mts:506 and 1104-1124).
         #
@@ -1176,7 +1176,24 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
         # below — this is ordinary XML escaping of < and > inside element
         # text. Never pass this formula through _xml_escape(): doing so would
         # double-escape it and the filter would silently mis-evaluate.
-        cond = (f'$Date &gt;= $$Date:"{fd}" and $Date &lt;= $$Date:"{td}"')
+        # Every extra filter is another way to get an empty result: if a
+        # build lacks $IsOptional, the whole expression evaluates false and
+        # Tally returns nothing at all — indistinguishable from "no data".
+        # So the plain variant filters on date ONLY.
+        # Two date literal forms. YYYYMMDD is what the most-deployed Tally
+        # extractor uses and should be locale-independent — but this build
+        # answered it with zero rows in 142ms, so the alternate is offered
+        # rather than assumed away.
+        if variant.endswith("_dmy"):
+            lo, hi = frm.strftime("%d-%b-%Y"), to.strftime("%d-%b-%Y")
+        else:
+            lo, hi = fd, td
+        cond = (f'$Date &gt;= $$Date:"{lo}" and $Date &lt;= $$Date:"{hi}"')
+        names = ("TBFltrPeriod" if variant.startswith("filter_plain")
+                 else "TBFltrPeriod,TBFltrNotCancelled,TBFltrNotOptional")
+        hygiene = ("" if variant.startswith("filter_plain") else
+                   '<SYSTEM TYPE="Formulae" NAME="TBFltrNotCancelled">NOT $IsCancelled</SYSTEM>'
+                   '<SYSTEM TYPE="Formulae" NAME="TBFltrNotOptional">NOT $IsOptional</SYSTEM>')
         return f"""<ENVELOPE>
  <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
   <TYPE>Collection</TYPE><ID>TB_Vouchers</ID></HEADER>
@@ -1188,11 +1205,10 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
    <COLLECTION NAME="TB_Vouchers" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
     <TYPE>Voucher</TYPE>
     <FETCH>Guid,Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate,Narration,PartyLedgerName,IsInvoice,IsCancelled,AlterID,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive</FETCH>
-    <FILTER>TBFltrPeriod,TBFltrNotCancelled,TBFltrNotOptional</FILTER>
+    <FILTER>{names}</FILTER>
    </COLLECTION>
    <SYSTEM TYPE="Formulae" NAME="TBFltrPeriod">{cond}</SYSTEM>
-   <SYSTEM TYPE="Formulae" NAME="TBFltrNotCancelled">NOT $IsCancelled</SYSTEM>
-   <SYSTEM TYPE="Formulae" NAME="TBFltrNotOptional">NOT $IsOptional</SYSTEM>
+   {hygiene}
   </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
 
     # variant == "all": no date scoping at all. Used as the guaranteed
@@ -1221,7 +1237,8 @@ _variant_cache: dict = {}
 _all_cache: dict = {}
 
 # Ordered best-first: precise and cheap before broad and heavy.
-_VARIANTS = ("filter", "daybook", "daybook_typed", "register")
+_VARIANTS = ("filter_plain", "filter_plain_dmy", "filter",
+             "daybook", "daybook_typed", "register")
 
 
 def _company_start(cfg: TallyConfig) -> "date | None":
@@ -1235,6 +1252,28 @@ def _company_start(cfg: TallyConfig) -> "date | None":
     except (TallyError, ValueError):
         pass
     return None
+
+
+def _has_any_vouchers(cfg: TallyConfig) -> bool:
+    """
+    Does this company hold ANY vouchers at all?
+
+    Needed to interpret an empty filtered result: a filter that matches
+    nothing looks identical to a company with no transactions, and treating a
+    broken filter as "no data" would quietly mirror an empty book.
+    """
+    key = (cfg.url, cfg.company, "any")
+    if key in _variant_cache:
+        return _variant_cache[key]
+    probe = TallyConfig(host=cfg.host, port=cfg.port, company=cfg.company,
+                        timeout=min(cfg.timeout, 90))
+    try:
+        raw = _post(probe, _voucher_request(cfg, date(1900, 1, 1), date(2100, 1, 1), "all"))
+        found = next(_parse_xml(raw).iter("VOUCHER"), None) is not None
+    except TallyError:
+        found = True      # unknown: assume yes, so an empty filter is suspect
+    _variant_cache[key] = found
+    return found
 
 
 def _probe_variant(cfg: TallyConfig, variant: str) -> str:
@@ -1254,10 +1293,14 @@ def _probe_variant(cfg: TallyConfig, variant: str) -> str:
     start = _company_start(cfg) or date(date.today().year, 4, 1)
     windows = [(start, start + timedelta(days=29)),
                (start + timedelta(days=90), start + timedelta(days=119))]
+    # Probe with a short timeout: a correct one-month request answers quickly,
+    # and a shape that hangs is not one worth waiting four minutes to reject.
+    probe = TallyConfig(host=cfg.host, port=cfg.port, company=cfg.company,
+                        timeout=min(cfg.timeout, 45))
     seen = []
     for frm, to in windows:
         try:
-            root = _parse_xml(_post(cfg, _voucher_request(cfg, frm, to, variant)))
+            root = _parse_xml(_post(probe, _voucher_request(cfg, frm, to, variant)))
         except TallyError:
             return "error"
         guids, out_of_range = set(), 0
@@ -1273,7 +1316,9 @@ def _probe_variant(cfg: TallyConfig, variant: str) -> str:
         seen.append(guids)
 
     if not seen[0] and not seen[1]:
-        return "empty"                # nothing in either window
+        # Empty is ambiguous. If the company demonstrably HAS vouchers, an
+        # empty filtered result means the filter is wrong, not the book.
+        return "filters everything out" if _has_any_vouchers(cfg) else "empty"
     if seen[0] and seen[0] == seen[1]:
         return "ignores"              # identical rows for two different months
     return "works"
@@ -1301,6 +1346,10 @@ def _pick_voucher_variant(cfg: TallyConfig) -> str:
             return variant
         log.info("Voucher request %r: %s — trying the next shape.",
                  variant, verdict)
+        if verdict == "filters everything out":
+            log.warning("  (%s: Tally answered quickly but matched no vouchers, "
+                        "while the company demonstrably has some — that shape's "
+                        "filter is not being applied as intended.)", variant)
 
     log.warning(
         "No voucher request on this Tally build honours date ranges. Falling "
@@ -1317,8 +1366,10 @@ def _fetch_all_once(cfg: TallyConfig) -> str:
     if key not in _all_cache:
         log.info("Fetching the complete voucher list for %s (one-off, may take "
                  "a few minutes)...", cfg.company)
-        _all_cache[key] = _post(cfg, _voucher_request(cfg, date(1900, 1, 1),
-                                                      date(2100, 1, 1), "all"))
+        big = TallyConfig(host=cfg.host, port=cfg.port, company=cfg.company,
+                          timeout=max(cfg.timeout, 900))
+        _all_cache[key] = _post(big, _voucher_request(cfg, date(1900, 1, 1),
+                                                     date(2100, 1, 1), "all"))
         log.info("  received %.1f MB", len(_all_cache[key]) / 1_048_576)
     return _all_cache[key]
 

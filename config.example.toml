@@ -5,7 +5,10 @@
 # host as "localhost". Otherwise use that machine's LAN IP, e.g. "192.168.1.7".
 host = "localhost"
 port = 9000
-timeout = 120
+# Seconds to wait for one Tally response. Raise this if a run reports
+# "Read timed out": a hosted Tally shared with staff can be slow, and the
+# one-off whole-company voucher fetch is heavy. 300 is a safe default.
+timeout = 300
 
 # Which Tally company files to sync.
 #
