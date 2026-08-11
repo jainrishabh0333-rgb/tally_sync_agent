@@ -240,6 +240,12 @@ class FrappeHandler(BaseHTTPRequestHandler):
             return self._json({"message": {"count": 2, "total_value": 177000.0, "rows": []}})
         if path.endswith("unbalanced_vouchers"):
             return self._json({"message": {"count": 0, "healthy": True, "rows": []}})
+        if path.endswith("search_items"):
+            return self._json({"message": {"count": 1, "distinct_names": ["Thermal Vest 402"], "rows": [{"item_name": "Thermal Vest 402", "closing_qty": 42.0, "closing_qty_raw": "3 Dzn 6 Pcs", "closing_value": 10500.0, "hsn_code": "61099010"}]}})
+        if path.endswith("stock_summary"):
+            return self._json({"message": {"by": "group", "count": 1, "total_value": 10500.0, "rows": [{"name": "Hosiery", "items": 1, "value": 10500.0, "qty": 42.0, "unit": "Pcs"}]}})
+        if path.endswith("hsn_gaps"):
+            return self._json({"message": {"count": 1, "value_at_risk": 22750.0, "rows": [{"item_name": "Sock Pack A", "closing_value": 22750.0}]}})
         if path.endswith("ageing_summary"):
             return self._json({"message": {"by": "group", "count": 1,
                 "total_outstanding": 168000.0, "total_overdue": 168000.0,

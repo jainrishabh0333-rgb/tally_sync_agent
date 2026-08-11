@@ -397,6 +397,79 @@ class Group:
 
 
 @dataclass
+class Unit:
+    """A unit of measure. Compound units carry a conversion, e.g. Dzn = 12 Pcs."""
+    name: str
+    company: str = ""
+    formal_name: str = ""
+    is_simple: bool = True
+    base_units: str = ""          # for a compound unit, the smaller unit
+    additional_units: str = ""    # the larger unit
+    conversion: float = 0.0       # how many base units make one additional
+    decimal_places: int = 0
+    guid: str = ""
+    alter_id: str = ""
+
+
+@dataclass
+class Godown:
+    """A storage location. These usually mirror the physical units."""
+    name: str
+    company: str = ""
+    parent: str = ""
+    has_no_stock: bool = False
+    is_external: bool = False
+    guid: str = ""
+    alter_id: str = ""
+
+
+@dataclass
+class StockGroup:
+    name: str
+    company: str = ""
+    parent: str = ""
+    primary_group: str = ""       # resolved root, e.g. "Hosiery"
+    guid: str = ""
+    alter_id: str = ""
+
+
+@dataclass
+class StockItem:
+    """
+    A product. Quantities are kept in three forms deliberately — see
+    _parse_qty for why a bare float loses information.
+    """
+    name: str
+    company: str = ""
+    parent: str = ""              # stock group
+    primary_group: str = ""       # resolved root product family
+    category: str = ""
+    part_no: str = ""
+    description: str = ""
+    base_units: str = ""
+    additional_units: str = ""
+    conversion: float = 0.0
+    opening_qty: float = 0.0
+    opening_qty_raw: str = ""
+    opening_value: float = 0.0
+    closing_qty: float = 0.0
+    closing_qty_raw: str = ""
+    closing_qty_unit: str = ""
+    closing_rate: float = 0.0
+    closing_rate_unit: str = ""
+    closing_value: float = 0.0
+    costing_method: str = ""
+    is_batchwise: bool = False
+    hsn_code: str = ""
+    hsn_description: str = ""
+    gst_rate: float = 0.0
+    taxability: str = ""
+    guid: str = ""
+    master_id: str = ""
+    alter_id: str = ""
+
+
+@dataclass
 class Bill:
     """
     One outstanding bill (invoice) against a party.
@@ -440,6 +513,273 @@ class Ledger:
 # ones are dropped progressively rather than assumed.
 _BILL_CORE = ["Name", "Parent", "BillDate", "ClosingBalance"]
 _BILL_EXTRA = ["BillCreditPeriod", "OpeningBalance", "IsAdvance", "BillFixed", "BaseClosing"]
+
+
+_QTY_RE = re.compile(r"(-?[\d,]+(?:\.\d+)?)\s*([A-Za-z%]*)")
+
+
+def _qty_pairs(text: str) -> list:
+    """Split a Tally quantity string into its (value, unit) components."""
+    return [(float(v.replace(",", "")), u)
+            for v, u in _QTY_RE.findall((text or "").strip()) if v]
+
+
+def _parse_qty(text: str, units: "dict | None" = None) -> tuple:
+    """
+    Parse a Tally quantity into (value, unit, raw), resolving compound units.
+
+    Tally renders quantities for display, not arithmetic. A compound unit
+    prints as several parts — "3 Dzn 6 Pcs" — and taking any single number
+    is wrong: that is 42 pieces, not 3 and not 6. Hosiery books use Dzn and
+    Box constantly, so this resolves the parts through the unit conversion
+    table into the smallest unit present.
+
+    Without a conversion table the parts cannot be combined safely, so the
+    largest component is reported and the raw string is ALWAYS preserved —
+    an unresolvable quantity should be visibly approximate, never silently
+    wrong.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return 0.0, "", ""
+    pairs = _qty_pairs(raw)
+    if not pairs:
+        return 0.0, "", raw
+    if len(pairs) == 1:
+        return pairs[0][0], pairs[0][1], raw
+
+    smallest_unit = pairs[-1][1]
+    # Tally signs the leading component only: "-2 Dzn 6 Pcs" means minus two
+    # dozen AND six, i.e. -30, not -24+6. Apply the sign to every part.
+    negative = pairs[0][0] < 0
+    if units:
+        total = 0.0
+        resolved = True
+        for value, unit in pairs:
+            factor = _conversion_to(unit, smallest_unit, units)
+            if factor is None:
+                resolved = False
+                break
+            total += abs(value) * factor
+        if resolved:
+            return (-total if negative else total), smallest_unit, raw
+
+    log.debug("Compound quantity %r could not be resolved; reporting the "
+              "largest component.", raw)
+    return pairs[0][0], pairs[0][1], raw
+
+
+def _conversion_to(unit: str, target: str, units: dict) -> "float | None":
+    """
+    How many `target` units make one `unit`. 1.0 when they are the same.
+
+    Follows the chain of compound-unit definitions (Box = 10 Dzn, Dzn = 12
+    Pcs) up to a small depth, so "12 Box 3 Dzn 4 Pcs" resolves correctly.
+    """
+    if unit == target:
+        return 1.0
+    factor = 1.0
+    cur = unit
+    for _ in range(6):
+        u = units.get(cur)
+        if u is None or not u.base_units or not u.conversion:
+            return None
+        factor *= u.conversion
+        cur = u.base_units
+        if cur == target:
+            return factor
+    return None
+
+
+_RATE_RE = re.compile(r"(-?[\d,]+(?:\.\d+)?)\s*/?\s*([A-Za-z]*)")
+
+
+def _parse_rate(text: str) -> tuple:
+    """Parse "45.50/Pcs" into (45.50, "Pcs"). The unit may differ from the
+    quantity's unit, which is why amount is never recomputed from qty x rate."""
+    m = _RATE_RE.search((text or "").strip())
+    if not m:
+        return 0.0, ""
+    return float(m.group(1).replace(",", "")), m.group(2) or ""
+
+
+def _master_request(cfg: TallyConfig, coll_id: str, tally_type: str,
+                    methods: list, frm: "date | None" = None,
+                    to: "date | None" = None) -> str:
+    """A Collection request for any master object."""
+    lines = "\n     ".join(f"<NATIVEMETHOD>{m}</NATIVEMETHOD>" for m in methods)
+    dates = ""
+    if frm and to:
+        # Closing figures are evaluated as at SVTODATE. Omitting the dates does
+        # not mean "now" — it means whatever period the Tally session happens
+        # to hold, which makes the export non-deterministic between runs.
+        dates = (f"<SVFROMDATE TYPE=\"Date\">{_fmt_date(frm)}</SVFROMDATE>"
+                 f"<SVTODATE TYPE=\"Date\">{_fmt_date(to)}</SVTODATE>")
+    return f"""<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE><ID>{coll_id}</ID></HEADER>
+ <BODY><DESC><STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   {dates}
+   {_company_tag(cfg)}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="{coll_id}" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+    <TYPE>{tally_type}</TYPE>
+     {lines}
+   </COLLECTION>
+  </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
+
+
+def _fetch_master(cfg: TallyConfig, coll_id: str, tally_type: str, tag: str,
+                  core: list, extra: list, frm=None, to=None) -> list:
+    """
+    Fetch a master collection, dropping optional fields a build rejects.
+
+    An unrecognised NATIVEMETHOD makes Tally return a LINEERROR that kills the
+    whole request, so optional fields are shed one at a time rather than
+    costing the entire object.
+    """
+    methods = core + extra
+    raw = None
+    while raw is None:
+        try:
+            raw = _post(cfg, _master_request(cfg, coll_id, tally_type, methods, frm, to))
+        except TallyError as exc:
+            if len(methods) > len(core):
+                dropped = methods.pop()
+                log.info("Tally rejected %r on %s; retrying without it.", dropped, tally_type)
+                continue
+            raise TallyError(f"Could not read {tally_type}: {exc}") from exc
+    return list(_parse_xml(raw).iter(tag))
+
+
+def fetch_units(cfg: TallyConfig) -> list:
+    """
+    Units of measure. Fetched FIRST: the conversion table is what makes every
+    quantity string in the inventory domain interpretable.
+    """
+    assert_company_loaded(cfg)
+    els = _fetch_master(
+        cfg, "TB_Units", "Unit", "UNIT",
+        ["Name"],
+        ["FormalName", "IsSimpleUnit", "BaseUnits", "AdditionalUnits",
+         "Conversion", "DecimalPlaces", "GUID", "AlterId"],
+    )
+    out = []
+    for el in els:
+        name = el.get("NAME") or _text(el.find("NAME"))
+        if not name:
+            continue
+        out.append(Unit(
+            name=name, company=cfg.company,
+            formal_name=_text(el.find("FORMALNAME")),
+            is_simple=_text(el.find("ISSIMPLEUNIT")).lower() != "no",
+            base_units=_text(el.find("BASEUNITS")),
+            additional_units=_text(el.find("ADDITIONALUNITS")),
+            conversion=_to_float(_text(el.find("CONVERSION"))),
+            decimal_places=int(_to_float(_text(el.find("DECIMALPLACES")))),
+            guid=_text(el.find("GUID")), alter_id=_text(el.find("ALTERID")),
+        ))
+    log.info("Fetched %d units", len(out))
+    return out
+
+
+def fetch_godowns(cfg: TallyConfig) -> list:
+    assert_company_loaded(cfg)
+    els = _fetch_master(
+        cfg, "TB_Godowns", "Godown", "GODOWN",
+        ["Name"], ["Parent", "HasNoStock", "IsExternal", "GUID", "AlterId"],
+    )
+    out = []
+    for el in els:
+        name = el.get("NAME") or _text(el.find("NAME"))
+        if not name:
+            continue
+        out.append(Godown(
+            name=name, company=cfg.company, parent=_text(el.find("PARENT")),
+            has_no_stock=_text(el.find("HASNOSTOCK")).lower() == "yes",
+            is_external=_text(el.find("ISEXTERNAL")).lower() == "yes",
+            guid=_text(el.find("GUID")), alter_id=_text(el.find("ALTERID")),
+        ))
+    log.info("Fetched %d godowns", len(out))
+    return out
+
+
+def fetch_stock_groups(cfg: TallyConfig) -> list:
+    assert_company_loaded(cfg)
+    els = _fetch_master(
+        cfg, "TB_StockGroups", "StockGroup", "STOCKGROUP",
+        ["Name"], ["Parent", "GUID", "AlterId"],
+    )
+    out = []
+    for el in els:
+        name = el.get("NAME") or _text(el.find("NAME"))
+        if not name:
+            continue
+        out.append(StockGroup(
+            name=name, company=cfg.company, parent=_text(el.find("PARENT")),
+            guid=_text(el.find("GUID")), alter_id=_text(el.find("ALTERID")),
+        ))
+    log.info("Fetched %d stock groups", len(out))
+    return out
+
+
+def fetch_stock_items(cfg: TallyConfig, as_on: "date | None" = None,
+                      units: "dict | None" = None) -> list:
+    """
+    Product masters with closing stock as at `as_on`.
+
+    Closing figures depend on the date window, so it is always sent explicitly
+    rather than inherited from whatever period the session holds.
+    """
+    assert_company_loaded(cfg)
+    as_on = as_on or date.today()
+    start = _company_start(cfg) or date(as_on.year, 4, 1)
+    els = _fetch_master(
+        cfg, "TB_StockItems", "StockItem", "STOCKITEM",
+        ["Name", "Parent", "BaseUnits", "ClosingBalance", "ClosingValue"],
+        ["Category", "PartNo", "Description", "AdditionalUnits", "Conversion",
+         "OpeningBalance", "OpeningValue", "ClosingRate", "CostingMethod",
+         "IsBatchWiseOn", "GUID", "MasterId", "AlterId",
+         "InfGSTHSNCode", "InfGSTHSNDescription", "InfGSTIGSTRate",
+         "InfGSTTaxablility"],
+        frm=start, to=as_on,
+    )
+    out = []
+    for el in els:
+        name = el.get("NAME") or _text(el.find("NAME"))
+        if not name:
+            continue
+        cq, cu, craw = _parse_qty(_text(el.find("CLOSINGBALANCE")), units)
+        oq, _, oraw = _parse_qty(_text(el.find("OPENINGBALANCE")), units)
+        rate, runit = _parse_rate(_text(el.find("CLOSINGRATE")))
+        out.append(StockItem(
+            name=name, company=cfg.company,
+            parent=_text(el.find("PARENT")),
+            category=_text(el.find("CATEGORY")),
+            part_no=_text(el.find("PARTNO")),
+            description=_text(el.find("DESCRIPTION")),
+            base_units=_text(el.find("BASEUNITS")),
+            additional_units=_text(el.find("ADDITIONALUNITS")),
+            conversion=_to_float(_text(el.find("CONVERSION"))),
+            opening_qty=oq, opening_qty_raw=oraw,
+            opening_value=_to_float(_text(el.find("OPENINGVALUE"))),
+            closing_qty=cq, closing_qty_raw=craw, closing_qty_unit=cu,
+            closing_rate=rate, closing_rate_unit=runit,
+            closing_value=_to_float(_text(el.find("CLOSINGVALUE"))),
+            costing_method=_text(el.find("COSTINGMETHOD")),
+            is_batchwise=_text(el.find("ISBATCHWISEON")).lower() == "yes",
+            hsn_code=_text(el.find("INFGSTHSNCODE")),
+            hsn_description=_text(el.find("INFGSTHSNDESCRIPTION")),
+            gst_rate=_to_float(_text(el.find("INFGSTIGSTRATE"))),
+            taxability=_text(el.find("INFGSTTAXABLILITY")),
+            guid=_text(el.find("GUID")),
+            master_id=_text(el.find("MASTERID")),
+            alter_id=_text(el.find("ALTERID")),
+        ))
+    log.info("Fetched %d stock items for %s", len(out), cfg.company)
+    return out
 
 
 def _bills_request(cfg: TallyConfig, frm: date, to: date, methods: list) -> str:

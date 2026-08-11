@@ -67,6 +67,63 @@ GROUPS = (
 )
 
 
+def units_xml() -> str:
+    return ("<ENVELOPE><BODY><DATA><COLLECTION>"
+            '<UNIT NAME="Pcs"><ISSIMPLEUNIT>Yes</ISSIMPLEUNIT>'
+            "<FORMALNAME>Pieces</FORMALNAME></UNIT>"
+            '<UNIT NAME="Dzn"><ISSIMPLEUNIT>No</ISSIMPLEUNIT>'
+            "<BASEUNITS>Pcs</BASEUNITS><CONVERSION>12</CONVERSION></UNIT>"
+            '<UNIT NAME="Box"><ISSIMPLEUNIT>No</ISSIMPLEUNIT>'
+            "<BASEUNITS>Dzn</BASEUNITS><CONVERSION>10</CONVERSION></UNIT>"
+            "</COLLECTION></DATA></BODY></ENVELOPE>")
+
+
+def godowns_xml() -> str:
+    return ("<ENVELOPE><BODY><DATA><COLLECTION>"
+            '<GODOWN NAME="Unit-C26"></GODOWN>'
+            '<GODOWN NAME="Unit-E29"></GODOWN>'
+            '<GODOWN NAME="Main Store"></GODOWN>'
+            "</COLLECTION></DATA></BODY></ENVELOPE>")
+
+
+def stock_groups_xml() -> str:
+    return ("<ENVELOPE><BODY><DATA><COLLECTION>"
+            '<STOCKGROUP NAME="Hosiery"></STOCKGROUP>'
+            '<STOCKGROUP NAME="Thermals"><PARENT>Hosiery</PARENT></STOCKGROUP>'
+            '<STOCKGROUP NAME="Vests"><PARENT>Hosiery</PARENT></STOCKGROUP>'
+            "</COLLECTION></DATA></BODY></ENVELOPE>")
+
+
+def stock_items_xml() -> str:
+    """Items exercising every quantity shape, including compound units."""
+    rows = [
+        # Compound: 3 Dzn 6 Pcs = 42 Pcs. Getting 3 or 6 here would be wrong.
+        '<STOCKITEM NAME="Thermal Vest 402"><PARENT>Thermals</PARENT>'
+        "<BASEUNITS>Pcs</BASEUNITS><CLOSINGBALANCE>3 Dzn 6 Pcs</CLOSINGBALANCE>"
+        "<CLOSINGRATE>250.00/Pcs</CLOSINGRATE><CLOSINGVALUE>10500.00</CLOSINGVALUE>"
+        "<INFGSTHSNCODE>61099010</INFGSTHSNCODE><INFGSTIGSTRATE>5</INFGSTIGSTRATE>"
+        "<GUID>item-1</GUID><ALTERID>1</ALTERID></STOCKITEM>",
+        # Three-level compound: 12 Box 3 Dzn 4 Pcs = 1480 Pcs.
+        '<STOCKITEM NAME="Cotton Vest 100"><PARENT>Vests</PARENT>'
+        "<BASEUNITS>Pcs</BASEUNITS><CLOSINGBALANCE>12 Box 3 Dzn 4 Pcs</CLOSINGBALANCE>"
+        "<CLOSINGRATE>90.00/Pcs</CLOSINGRATE><CLOSINGVALUE>133200.00</CLOSINGVALUE>"
+        "<INFGSTHSNCODE>61099010</INFGSTHSNCODE>"
+        "<GUID>item-2</GUID><ALTERID>2</ALTERID></STOCKITEM>",
+        # Simple unit, and NO HSN — must be flagged as a GST exposure.
+        '<STOCKITEM NAME="Sock Pack A"><PARENT>Hosiery</PARENT>'
+        "<BASEUNITS>Pcs</BASEUNITS><CLOSINGBALANCE>500 Pcs</CLOSINGBALANCE>"
+        "<CLOSINGRATE>45.50/Pcs</CLOSINGRATE><CLOSINGVALUE>22750.00</CLOSINGVALUE>"
+        "<GUID>item-3</GUID><ALTERID>3</ALTERID></STOCKITEM>",
+        # Negative (over-issued) compound: -2 Dzn 6 Pcs = -30.
+        '<STOCKITEM NAME="Return Bin"><PARENT>Hosiery</PARENT>'
+        "<BASEUNITS>Pcs</BASEUNITS><CLOSINGBALANCE>-2 Dzn 6 Pcs</CLOSINGBALANCE>"
+        "<CLOSINGVALUE>-1500.00</CLOSINGVALUE>"
+        "<GUID>item-4</GUID><ALTERID>4</ALTERID></STOCKITEM>",
+    ]
+    return ("<ENVELOPE><BODY><DATA><COLLECTION>" + "".join(rows)
+            + "</COLLECTION></DATA></BODY></ENVELOPE>")
+
+
 def bills_xml() -> str:
     """Open bills. Debit-positive receivables export NEGATIVE, per Tally."""
     rows = []
@@ -214,6 +271,18 @@ class TallyHandler(BaseHTTPRequestHandler):
                        f'<COMPANY NAME="{COMPANY}"><STARTINGFROM>20260401</STARTINGFROM></COMPANY>'
                        f'<COMPANY NAME="{OLD_COMPANY}"><STARTINGFROM>20240401</STARTINGFROM></COMPANY>'
                        f"</COLLECTION></DATA></BODY></ENVELOPE>")
+        elif "TB_Units" in body:
+            payload = units_xml()
+        elif "TB_Godowns" in body:
+            payload = godowns_xml()
+        elif "TB_StockGroups" in body:
+            payload = stock_groups_xml()
+        elif "TB_StockItems" in body:
+            # Reject an optional field once, proving graceful degradation.
+            if "MarketValuationMethod" in body:
+                payload = "<ENVELOPE><BODY><DATA><LINEERROR>Unknown</LINEERROR></DATA></BODY></ENVELOPE>"
+            else:
+                payload = stock_items_xml()
         elif "TB_Bills" in body:
             # A build that rejects an optional field: refuse BillFixed once,
             # proving the agent degrades gracefully instead of failing.
@@ -307,6 +376,15 @@ class FrappeHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if path.endswith("upsert_inventory"):
+            c = body.get("company")
+            for k in ("units", "godowns", "stock_groups", "stock_items"):
+                store.setdefault(k, [])
+                store[k] = [r for r in store[k] if r.get("company") != c]
+                store[k].extend(body.get(k) or [])
+            return self._json({"message": {
+                k: {"created": len(body.get(k) or [])}
+                for k in ("units", "godowns", "stock_groups", "stock_items")}})
         if path.endswith("upsert_bills"):
             store["bills"] = [b for b in store.get("bills", [])
                               if b.get("company") != body.get("company")]
@@ -476,6 +554,36 @@ def main() -> int:
                adv["is_advance"] and adv["closing"] < 0)
 
     check_true("bill count reported in the run summary", "bills" in out)
+
+    # --- inventory --------------------------------------------------------
+    items = store.get("stock_items", [])
+    check("stock items mirrored (both companies)", len(items), 8)
+    check("units mirrored", len(store.get("units", [])), 6)
+    check("godowns mirrored", len(store.get("godowns", [])), 6)
+
+    tv = next(i for i in items if i["name"] == "Thermal Vest 402")
+    check("compound qty resolved: 3 Dzn 6 Pcs = 42 Pcs", tv["closing_qty"], 42.0)
+    check("raw quantity preserved for audit", tv["closing_qty_raw"], "3 Dzn 6 Pcs")
+    check("resolved unit is the smallest", tv["closing_qty_unit"], "Pcs")
+    check("HSN captured", tv["hsn_code"], "61099010")
+    check("GST rate captured", tv["gst_rate"], 5.0)
+
+    cv = next(i for i in items if i["name"] == "Cotton Vest 100")
+    check("three-level compound: 12 Box 3 Dzn 4 Pcs = 1480", cv["closing_qty"], 1480.0)
+
+    rb = next(i for i in items if i["name"] == "Return Bin")
+    check("negative compound signed correctly", rb["closing_qty"], -30.0)
+
+    sp = next(i for i in items if i["name"] == "Sock Pack A")
+    check("simple quantity", sp["closing_qty"], 500.0)
+    check("rate parsed from '45.50/Pcs'", sp["closing_rate"], 45.5)
+    check_true("item with no HSN flagged in the log",
+               "have NO HSN code" in out, out[-300:])
+
+    check_true("stock group resolved to its product family",
+               tv["primary_group"] == "Hosiery",
+               f"got {tv.get('primary_group')!r}")
+    check_true("item count reported in the run summary", "items" in out)
 
     # Sync log written with Success.
     check_true("sync log recorded", len(store["logs"]) >= 1)

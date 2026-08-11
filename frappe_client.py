@@ -144,6 +144,13 @@ class FrappeClient:
             json={"bills": bills, "company": company, "replace": 1},
         )
 
+    def upsert_inventory(self, company: str, **payload) -> dict:
+        return self._call(
+            "POST",
+            "/api/method/tally_bridge.api.upsert_inventory",
+            json={"company": company, **payload},
+        )
+
     def log_sync(self, status: str, detail: dict[str, Any]) -> None:
         try:
             self._call(

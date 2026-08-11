@@ -34,7 +34,11 @@ from tally_client import (
     TallyError,
     _tally_date_to_iso,
     fetch_bills,
+    fetch_godowns,
     fetch_groups,
+    fetch_stock_groups,
+    fetch_stock_items,
+    fetch_units,
     fetch_ledgers,
     fetch_vouchers,
     list_companies,
@@ -257,6 +261,67 @@ def date_chunks(frm: date, to: date, days: int):
 # Sync steps
 # ---------------------------------------------------------------------------
 
+def sync_inventory(st: Settings, fc: FrappeClient) -> int:
+    """
+    Mirror inventory masters: units, godowns, stock groups, then items.
+
+    Units are fetched FIRST and passed into the item parse, because compound
+    quantities ("3 Dzn 6 Pcs") cannot be resolved without the conversion
+    table — and an unresolved quantity in a hosiery book is not a rounding
+    error, it is off by a factor of twelve.
+    """
+    log.info("Syncing inventory masters...")
+    try:
+        units = fetch_units(st.tally)
+        godowns = fetch_godowns(st.tally)
+        groups = fetch_stock_groups(st.tally)
+    except TallyError as exc:
+        log.warning("Skipping inventory for %s: %s", st.tally.company, exc)
+        return 0
+
+    unit_map = {u.name: u for u in units}
+    try:
+        items = fetch_stock_items(st.tally, date.today(), unit_map)
+    except TallyError as exc:
+        log.warning("Could not read stock items for %s: %s", st.tally.company, exc)
+        items = []
+
+    if not items and not units:
+        log.info("  no inventory in this company — likely an accounts-only book.")
+        return 0
+
+    # Resolve each item's stock group to its root, the same way ledgers are
+    # resolved, so reporting groups by product family rather than sub-group.
+    by_name = {g.name: g for g in groups}
+    for g in groups:
+        chain = resolve_group_chain(g.parent, by_name) if g.parent else []
+        g.primary_group = chain[-1] if chain else (g.parent or g.name)
+    root_of = {g.name: (g.primary_group or g.name) for g in groups}
+    for it in items:
+        it.primary_group = root_of.get(it.parent, it.parent)
+
+    res = fc.upsert_inventory(
+        st.tally.company,
+        units=[dataclasses.asdict(u) for u in units],
+        godowns=[dataclasses.asdict(g) for g in godowns],
+        stock_groups=[dataclasses.asdict(g) for g in groups],
+        stock_items=[dataclasses.asdict(i) for i in items],
+    ) or {}
+    msg = res.get("message", res) if isinstance(res, dict) else {}
+    for kind in ("units", "godowns", "stock_groups", "stock_items"):
+        _report_rejects(msg.get(kind) or {}, kind[:-1])
+
+    compound = sum(1 for i in items if i.closing_qty_raw.count(" ") > 1)
+    no_hsn = sum(1 for i in items if not i.hsn_code and i.closing_value)
+    log.info("  %d units, %d godowns, %d groups, %d items",
+             len(units), len(godowns), len(groups), len(items))
+    if compound:
+        log.info("  %d items use compound units — resolved via the unit table.", compound)
+    if no_hsn:
+        log.warning("  %d items hold stock but have NO HSN code (GST exposure).", no_hsn)
+    return len(items)
+
+
 def sync_bills(st: Settings, fc: FrappeClient) -> int:
     """
     Mirror outstanding bills for the current company.
@@ -476,6 +541,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vouchers-only", action="store_true")
     p.add_argument("--no-bills", action="store_true",
                    help="skip the outstanding-bills snapshot")
+    p.add_argument("--no-inventory", action="store_true",
+                   help="skip inventory masters")
     p.add_argument("--company", metavar="NAME", default=None,
                    help="sync only this company, ignoring config.toml. "
                         "The name must match Tally exactly.")
@@ -520,7 +587,7 @@ def main() -> int:
     log.info("Syncing %d compan%s: %s",
              len(companies), "y" if len(companies) == 1 else "ies", ", ".join(companies))
 
-    totals = {"ledgers": 0, "vouchers": 0, "bills": 0}
+    totals = {"ledgers": 0, "vouchers": 0, "bills": 0, "items": 0}
     failed: list = []
 
     for company in companies:
@@ -536,6 +603,8 @@ def main() -> int:
                 # already present to denormalise onto each bill.
                 if not args.no_bills:
                     counts["bills"] = sync_bills(st, fc)
+                if not args.no_inventory:
+                    counts["items"] = sync_inventory(st, fc)
             if not args.ledgers_only:
                 frm, to = resolve_range(st, fc, args, company)
                 counts["vouchers"] = sync_vouchers(st, fc, frm, to)
@@ -552,15 +621,17 @@ def main() -> int:
         counts["seconds"] = round((datetime.now() - c_started).total_seconds(), 1)
         totals["ledgers"] += counts["ledgers"]
         totals["bills"] = totals.get("bills", 0) + counts.get("bills", 0)
+        totals["items"] = totals.get("items", 0) + counts.get("items", 0)
         totals["vouchers"] += counts["vouchers"]
         log.info("%s: %d ledgers, %d vouchers in %.1fs",
                  company, counts["ledgers"], counts["vouchers"], counts["seconds"])
         fc.log_sync("Success", counts)
 
     elapsed = round((datetime.now() - started).total_seconds(), 1)
-    log.info("All done in %.1fs — %d ledgers, %d bills, %d vouchers across %d compan%s%s",
+    log.info("All done in %.1fs — %d ledgers, %d bills, %d items, %d vouchers "
+             "across %d compan%s%s",
              elapsed, totals["ledgers"], totals.get("bills", 0),
-             totals["vouchers"], len(companies),
+             totals.get("items", 0), totals["vouchers"], len(companies),
              "y" if len(companies) == 1 else "ies",
              f" ({len(failed)} failed: {', '.join(failed)})" if failed else "")
     return 1 if failed else 0
