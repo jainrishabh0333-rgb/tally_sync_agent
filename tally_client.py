@@ -397,6 +397,27 @@ class Group:
 
 
 @dataclass
+class Bill:
+    """
+    One outstanding bill (invoice) against a party.
+
+    Tally's Bills collection returns only bills with a balance still open — a
+    fully paid invoice disappears from it. So this mirrors what is UNPAID, not
+    a full invoice history.
+    """
+    name: str                        # bill reference, e.g. "SL/1234"
+    party: str = ""                  # the ledger it belongs to
+    company: str = ""
+    bill_date: str = ""              # ISO
+    credit_period: str = ""          # raw Tally text: "45 Days", "2 Months"
+    due_date: str = ""               # computed
+    overdue_days: int = 0            # computed, negative = not yet due
+    opening: float = 0.0             # debit-positive
+    closing: float = 0.0             # debit-positive; the amount still unpaid
+    is_advance: bool = False
+
+
+@dataclass
 class Ledger:
     name: str
     company: str = ""                # which Tally company this belongs to
@@ -412,6 +433,113 @@ class Ledger:
     guid: str = ""
     master_id: str = ""              # Tally internal id (stable per company)
     alter_id: str = ""               # bumps on every edit -> incremental sync
+
+
+# Bill-wise fields, most valuable first. Tally answers an unrecognised
+# NATIVEMETHOD with a LINEERROR that kills the whole request, so the optional
+# ones are dropped progressively rather than assumed.
+_BILL_CORE = ["Name", "Parent", "BillDate", "ClosingBalance"]
+_BILL_EXTRA = ["BillCreditPeriod", "OpeningBalance", "IsAdvance", "BillFixed", "BaseClosing"]
+
+
+def _bills_request(cfg: TallyConfig, frm: date, to: date, methods: list) -> str:
+    lines = "\n     ".join(f"<NATIVEMETHOD>{m}</NATIVEMETHOD>" for m in methods)
+    return f"""<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE><ID>TB_Bills</ID></HEADER>
+ <BODY><DESC><STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   <SVFROMDATE TYPE="Date">{_fmt_date(frm)}</SVFROMDATE>
+   <SVTODATE TYPE="Date">{_fmt_date(to)}</SVTODATE>
+   {_company_tag(cfg)}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="TB_Bills" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+    <TYPE>Bills</TYPE>
+     {lines}
+   </COLLECTION>
+  </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
+
+
+_CREDIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([A-Za-z]*)")
+
+
+def _parse_credit_days(text: str) -> int:
+    """
+    Turn Tally's free-text credit period into days.
+
+    Accountants type "45 Days", "2 Months", "5W", "60", or leave it blank.
+    Blank means due on the bill date, which is Tally's own default.
+    """
+    m = _CREDIT_RE.search(text or "")
+    if not m:
+        return 0
+    n = float(m.group(1))
+    unit = (m.group(2) or "d").lower()[:1]
+    return int(n * {"d": 1, "w": 7, "m": 30, "y": 365}.get(unit, 1))
+
+
+def fetch_bills(cfg: TallyConfig, as_on: date) -> list:
+    """
+    Outstanding bills for the current company, with ageing computed here.
+
+    Tally returns no ageing buckets — only a bill date and a free-text credit
+    period — so the due date and overdue days are derived. Optional fields are
+    dropped one at a time if this build rejects them, so a single unsupported
+    method cannot cost the whole request.
+    """
+    assert_company_loaded(cfg)
+    start = _company_start(cfg) or date(as_on.year, 4, 1)
+
+    methods = _BILL_CORE + _BILL_EXTRA
+    raw = None
+    while raw is None:
+        try:
+            raw = _post(cfg, _bills_request(cfg, start, as_on, methods))
+        except TallyError as exc:
+            if len(methods) > len(_BILL_CORE):
+                dropped = methods.pop()
+                log.info("Tally rejected the %r bill field; retrying without it.", dropped)
+                continue
+            raise TallyError(
+                f"Could not read outstanding bills: {exc}\n"
+                "If this build has no Bills collection, bill-wise details may "
+                "be switched off for this company (F11 > Accounting > Maintain "
+                "bill-wise details)."
+            ) from exc
+
+    root = _parse_xml(raw)
+    bills: list = []
+    for el in root.iter("BILLS"):
+        name = el.get("NAME") or _text(el.find("NAME"))
+        party = _text(el.find("PARENT"))
+        if not name or not party:
+            continue
+        bill_date = _tally_date_to_iso(_text(el.find("BILLDATE")))
+        credit = _text(el.find("BILLCREDITPERIOD"))
+        due = ""
+        overdue = 0
+        if len(bill_date) == 10:
+            try:
+                d = date.fromisoformat(bill_date) + timedelta(days=_parse_credit_days(credit))
+                due = d.isoformat()
+                overdue = (as_on - d).days
+            except ValueError:
+                pass
+        bills.append(Bill(
+            name=name,
+            party=party,
+            company=cfg.company,
+            bill_date=bill_date,
+            credit_period=credit,
+            due_date=due,
+            overdue_days=overdue,
+            opening=_to_debit_positive(_text(el.find("OPENINGBALANCE"))),
+            closing=_to_debit_positive(_text(el.find("CLOSINGBALANCE"))),
+            is_advance=_text(el.find("ISADVANCE")).lower() == "yes",
+        ))
+    log.info("Fetched %d outstanding bills for %s", len(bills), cfg.company)
+    return bills
 
 
 def _ledgers_request(cfg: TallyConfig) -> str:

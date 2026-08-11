@@ -67,6 +67,38 @@ GROUPS = (
 )
 
 
+def bills_xml() -> str:
+    """Open bills. Debit-positive receivables export NEGATIVE, per Tally."""
+    rows = []
+    # 40 overdue: dated 15-Apr with 45-day terms, so due 30-May.
+    for i in range(40):
+        rows.append(
+            f'<BILLS NAME="SL/{i:04d}"><PARENT>Customer {i:04d}</PARENT>'
+            f"<BILLDATE>20260415</BILLDATE>"
+            f"<BILLCREDITPERIOD>45 Days</BILLCREDITPERIOD>"
+            f"<OPENINGBALANCE>-{(i + 1) * 1000}.00</OPENINGBALANCE>"
+            f"<CLOSINGBALANCE>-{(i + 1) * 1000}.00</CLOSINGBALANCE>"
+            f"<ISADVANCE>No</ISADVANCE></BILLS>"
+        )
+    # 10 not yet due: dated 1-Aug with 3-month terms, so due 30-Oct.
+    for i in range(40, 50):
+        rows.append(
+            f'<BILLS NAME="SL/{i:04d}"><PARENT>Customer {i:04d}</PARENT>'
+            f"<BILLDATE>20260801</BILLDATE>"
+            f"<BILLCREDITPERIOD>3 Months</BILLCREDITPERIOD>"
+            f"<CLOSINGBALANCE>-{(i + 1) * 1000}.00</CLOSINGBALANCE>"
+            f"<ISADVANCE>No</ISADVANCE></BILLS>"
+        )
+    # A customer advance — must never be counted as money owed to us.
+    rows.append(
+        '<BILLS NAME="ADV/1"><PARENT>Customer 0001</PARENT>'
+        "<BILLDATE>20260501</BILLDATE><CLOSINGBALANCE>25000.00</CLOSINGBALANCE>"
+        "<ISADVANCE>Yes</ISADVANCE></BILLS>"
+    )
+    return ("<ENVELOPE><BODY><DATA><COLLECTION>" + "".join(rows)
+            + "</COLLECTION></DATA></BODY></ENVELOPE>")
+
+
 def groups_xml() -> str:
     rows = "".join(
         f'<GROUP NAME="{n}"><PARENT>{p}</PARENT></GROUP>' for n, p in GROUPS
@@ -182,6 +214,13 @@ class TallyHandler(BaseHTTPRequestHandler):
                        f'<COMPANY NAME="{COMPANY}"><STARTINGFROM>20260401</STARTINGFROM></COMPANY>'
                        f'<COMPANY NAME="{OLD_COMPANY}"><STARTINGFROM>20240401</STARTINGFROM></COMPANY>'
                        f"</COLLECTION></DATA></BODY></ENVELOPE>")
+        elif "TB_Bills" in body:
+            # A build that rejects an optional field: refuse BillFixed once,
+            # proving the agent degrades gracefully instead of failing.
+            if "BillFixed" in body:
+                payload = "<ENVELOPE><BODY><DATA><LINEERROR>Unknown method BillFixed</LINEERROR></DATA></BODY></ENVELOPE>"
+            else:
+                payload = bills_xml()
         elif "TB_Groups" in body:
             payload = groups_xml()
         elif "TB_Ledgers" in body:
@@ -240,7 +279,7 @@ class TallyHandler(BaseHTTPRequestHandler):
 # Mock Frappe: validates like the real one (email!), records everything
 # ---------------------------------------------------------------------------
 
-store = {"ledgers": [], "vouchers": [], "logs": [], "flaked": []}
+store = {"ledgers": [], "vouchers": [], "logs": [], "flaked": [], "bills": []}
 
 
 class FrappeHandler(BaseHTTPRequestHandler):
@@ -268,6 +307,11 @@ class FrappeHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if path.endswith("upsert_bills"):
+            store["bills"] = [b for b in store.get("bills", [])
+                              if b.get("company") != body.get("company")]
+            store.setdefault("bills", []).extend(body.get("bills", []))
+            return self._json({"message": {"created": len(body.get("bills", []))}})
         if path.endswith("upsert_ledgers"):
             rows = body.get("ledgers", [])
             good = [r for r in rows if "@" in (r.get("email") or "") or not r.get("email")]
@@ -401,6 +445,37 @@ def main() -> int:
     check_true("the TDL-filtered request was chosen", "using 'filter'" in out)
     check_true("the stuck same-day voucher never entered the mirror",
                not any(v.get("guid") == "stuck-day-guid" for v in store["vouchers"]))
+
+    # --- bill-wise ageing -------------------------------------------------
+    bills = store.get("bills", [])
+    # 51 bills per company file, and the mock serves both.
+    check("bills mirrored across both companies", len(bills), 102)
+    check_true("each company's bills are labelled with it",
+               len({b["company"] for b in bills}) == 2,
+               f"got {{b['company'] for b in bills}}")
+    check_true("agent degraded past the rejected optional field",
+               "rejected the 'BillFixed' bill field" in out, out[-300:])
+
+    overdue = [b for b in bills if b["overdue_days"] > 0 and not b["is_advance"]]
+    notdue = [b for b in bills if b["overdue_days"] <= 0 and not b["is_advance"]]
+    check("overdue bills counted", len(overdue), 80)
+    check("not-yet-due bills counted", len(notdue), 20)
+
+    b0 = next(b for b in bills if b["name"] == "SL/0000")  # either company
+    check("receivable bill is debit-positive", b0["closing"], 1000.0)
+    check("due date = bill date + credit period", b0["due_date"], "2026-05-30")
+    check_true("overdue days computed", b0["overdue_days"] > 70,
+               f"got {b0['overdue_days']}")
+
+    words = next(b for b in bills if b["name"] == "SL/0040")
+    check("credit period in words parsed", words["due_date"], "2026-10-30")
+    check_true("not-yet-due is negative", words["overdue_days"] < 0)
+
+    adv = next(b for b in bills if b["name"] == "ADV/1")
+    check_true("customer advance flagged, not a receivable",
+               adv["is_advance"] and adv["closing"] < 0)
+
+    check_true("bill count reported in the run summary", "bills" in out)
 
     # Sync log written with Success.
     check_true("sync log recorded", len(store["logs"]) >= 1)

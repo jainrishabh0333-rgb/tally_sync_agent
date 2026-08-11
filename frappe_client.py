@@ -137,6 +137,13 @@ class FrappeClient:
             json={"vouchers": vouchers},
         )
 
+    def upsert_bills(self, bills: list[dict[str, Any]], company: str) -> dict:
+        return self._call(
+            "POST",
+            "/api/method/tally_bridge.api.upsert_bills",
+            json={"bills": bills, "company": company, "replace": 1},
+        )
+
     def log_sync(self, status: str, detail: dict[str, Any]) -> None:
         try:
             self._call(

@@ -240,6 +240,26 @@ class FrappeHandler(BaseHTTPRequestHandler):
             return self._json({"message": {"count": 2, "total_value": 177000.0, "rows": []}})
         if path.endswith("unbalanced_vouchers"):
             return self._json({"message": {"count": 0, "healthy": True, "rows": []}})
+        if path.endswith("ageing_summary"):
+            return self._json({"message": {"by": "group", "count": 1,
+                "total_outstanding": 168000.0, "total_overdue": 168000.0,
+                "rows": [{"name": "AGENT RK", "bills": 2, "total": 168000.0,
+                          "overdue": 168000.0, "over_90": 0.0,
+                          "worst_days": 75, "overdue_pct": 100.0}]}})
+        if path.endswith("ageing"):
+            return self._json({"message": {"party_type": "receivable", "count": 1,
+                "total_outstanding": 168000.0,
+                "buckets": {"61-90": {"bills": 1, "amount": 168000.0}},
+                "rows": [{"party": "Acme Traders & Co", "bill_ref": "SL/0001",
+                          "bill_date": "2025-04-15", "due_date": "2025-05-30",
+                          "overdue_days": 75, "outstanding": 168000.0,
+                          "primary_group": "Sundry Debtors"}]}})
+        if path.endswith("bills_due_between"):
+            return self._json({"message": {"count": 1, "party_count": 1,
+                "total": 168000.0, "period": {"from": "", "to": ""},
+                "rows": [{"party": "Acme Traders & Co", "bill_ref": "SL/0001",
+                          "due_date": "2025-05-30", "overdue_days": 75,
+                          "outstanding": 168000.0}]}})
         if path.endswith("recent_failures"):
             return self._json({"message": {"count": 0, "rows": []}})
         if path.endswith("companies"):

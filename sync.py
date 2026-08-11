@@ -33,6 +33,7 @@ from tally_client import (
     TallyConfig,
     TallyError,
     _tally_date_to_iso,
+    fetch_bills,
     fetch_groups,
     fetch_ledgers,
     fetch_vouchers,
@@ -256,6 +257,37 @@ def date_chunks(frm: date, to: date, days: int):
 # Sync steps
 # ---------------------------------------------------------------------------
 
+def sync_bills(st: Settings, fc: FrappeClient) -> int:
+    """
+    Mirror outstanding bills for the current company.
+
+    Tally returns only bills that are still unpaid, so this is a snapshot: the
+    Frappe side clears the company's previous rows before inserting, or paid
+    invoices would linger and overstate what is owed.
+    """
+    log.info("Syncing outstanding bills...")
+    try:
+        bills = fetch_bills(st.tally, date.today())
+    except TallyError as exc:
+        # Bill-wise details may simply be switched off for this company. That
+        # is a configuration choice, not a sync failure — carry on.
+        log.warning("Skipping bills for %s: %s", st.tally.company, exc)
+        return 0
+    if not bills:
+        log.info("  no outstanding bills reported.")
+        return 0
+
+    payload = [dataclasses.asdict(b) for b in bills]
+    res = fc.upsert_bills(payload, st.tally.company) or {}
+    msg = res.get("message", res) if isinstance(res, dict) else {}
+    rejected = _report_rejects(msg, "bill")
+    overdue = sum(1 for b in bills if b.overdue_days > 0)
+    log.info("  %d bills (%d overdue), %s",
+             len(payload) - rejected, overdue,
+             f"{rejected} rejected" if rejected else "none rejected")
+    return len(payload) - rejected
+
+
 def _report_rejects(msg, kind: str) -> int:
     """
     Log any rows Frappe refused, and return how many.
@@ -442,6 +474,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", dest="to", metavar="YYYY-MM-DD")
     p.add_argument("--ledgers-only", action="store_true")
     p.add_argument("--vouchers-only", action="store_true")
+    p.add_argument("--no-bills", action="store_true",
+                   help="skip the outstanding-bills snapshot")
     p.add_argument("--company", metavar="NAME", default=None,
                    help="sync only this company, ignoring config.toml. "
                         "The name must match Tally exactly.")
@@ -486,7 +520,7 @@ def main() -> int:
     log.info("Syncing %d compan%s: %s",
              len(companies), "y" if len(companies) == 1 else "ies", ", ".join(companies))
 
-    totals = {"ledgers": 0, "vouchers": 0}
+    totals = {"ledgers": 0, "vouchers": 0, "bills": 0}
     failed: list = []
 
     for company in companies:
@@ -498,6 +532,10 @@ def main() -> int:
         try:
             if not args.vouchers_only:
                 counts["ledgers"] = sync_ledgers(st, fc)
+                # Bills come after ledgers so party group and GSTIN are
+                # already present to denormalise onto each bill.
+                if not args.no_bills:
+                    counts["bills"] = sync_bills(st, fc)
             if not args.ledgers_only:
                 frm, to = resolve_range(st, fc, args, company)
                 counts["vouchers"] = sync_vouchers(st, fc, frm, to)
@@ -513,14 +551,16 @@ def main() -> int:
 
         counts["seconds"] = round((datetime.now() - c_started).total_seconds(), 1)
         totals["ledgers"] += counts["ledgers"]
+        totals["bills"] = totals.get("bills", 0) + counts.get("bills", 0)
         totals["vouchers"] += counts["vouchers"]
         log.info("%s: %d ledgers, %d vouchers in %.1fs",
                  company, counts["ledgers"], counts["vouchers"], counts["seconds"])
         fc.log_sync("Success", counts)
 
     elapsed = round((datetime.now() - started).total_seconds(), 1)
-    log.info("All done in %.1fs — %d ledgers, %d vouchers across %d compan%s%s",
-             elapsed, totals["ledgers"], totals["vouchers"], len(companies),
+    log.info("All done in %.1fs — %d ledgers, %d bills, %d vouchers across %d compan%s%s",
+             elapsed, totals["ledgers"], totals.get("bills", 0),
+             totals["vouchers"], len(companies),
              "y" if len(companies) == 1 else "ies",
              f" ({len(failed)} failed: {', '.join(failed)})" if failed else "")
     return 1 if failed else 0
