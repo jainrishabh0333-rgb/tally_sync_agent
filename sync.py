@@ -68,6 +68,47 @@ class Settings:
     fy_start_month: int = 4       # Indian financial year starts April
 
 
+def _read_toml(cfg_path: Path) -> dict:
+    """
+    Parse config.toml, tolerating what Windows text editors do to files.
+
+    Notepad on Windows Server writes UTF-8 *with* a byte-order mark by default,
+    and can also be talked into UTF-16. Python's TOML parser rejects both with
+    "Invalid statement (at line 1, column 1)", which gives no hint that the
+    problem is three invisible bytes rather than anything the user typed. The
+    encoding is detected and stripped here so an ordinary edit-and-save works.
+    """
+    raw = cfg_path.read_bytes()
+
+    if raw.startswith(b"\xef\xbb\xbf"):          # UTF-8 BOM (Notepad default)
+        text = raw[3:].decode("utf-8")
+    elif raw.startswith((b"\xff\xfe", b"\xfe\xff")):   # UTF-16, "Unicode" in Notepad
+        text = raw.decode("utf-16")
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252", errors="replace")  # Notepad "ANSI"
+
+    text = text.replace("\r\n", "\n").lstrip("﻿")
+
+    try:
+        return tomllib.loads(text)
+    except Exception as exc:
+        lines = text.splitlines()
+        lineno = getattr(exc, "lineno", None)
+        where = ""
+        if isinstance(lineno, int) and 1 <= lineno <= len(lines):
+            where = f"\n\n  Line {lineno}:  {lines[lineno - 1]!r}"
+        elif lines:
+            where = f"\n\n  First line:  {lines[0]!r}"
+        sys.exit(
+            f"Could not read {cfg_path.name}: {exc}{where}\n\n"
+            "Every setting must look like  key = \"value\"  under a [section] header.\n"
+            "Text values need double quotes. Compare against config.example.toml."
+        )
+
+
 def load_settings(path: Path | None = None) -> Settings:
     cfg_path = path or (HERE / "config.toml")
     data: dict = {}
@@ -77,8 +118,7 @@ def load_settings(path: Path | None = None) -> Settings:
                 "config.toml found but no TOML parser available.\n"
                 "Run: pip install tomli   (or use Python 3.11+)"
             )
-        with cfg_path.open("rb") as fh:
-            data = tomllib.load(fh)
+        data = _read_toml(cfg_path)
 
     t = data.get("tally", {})
     f = data.get("frappe", {})
