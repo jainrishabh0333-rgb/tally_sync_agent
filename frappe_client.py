@@ -11,6 +11,7 @@ inbound firewall rules needed.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,10 +49,39 @@ class FrappeClient:
 
     def _call(self, method: str, path: str, **kwargs) -> Any:
         url = f"{self.cfg.url.rstrip('/')}{path}"
-        try:
-            resp = self.session.request(method, url, timeout=self.cfg.timeout, **kwargs)
-        except requests.RequestException as exc:
-            raise FrappeError(f"Cannot reach Frappe at {url}: {exc}") from exc
+
+        # Frappe Cloud restarts workers routinely, so a lone 502/503 or a
+        # dropped keep-alive connection is normal weather, not a failure.
+        # Retrying is safe here: the upsert endpoints are GUID-keyed and
+        # idempotent by design. Without this, one platform hiccup costs the
+        # operator an entire run.
+        resp = None
+        last_exc: Exception | None = None
+        for attempt in range(4):
+            if attempt:
+                wait = 2 ** attempt          # 2s, 4s, 8s
+                log.warning("Frappe unavailable (%s), retrying in %ds "
+                            "(attempt %d/4)...",
+                            last_exc or f"HTTP {resp.status_code}", wait, attempt + 1)
+                time.sleep(wait)
+            try:
+                resp = self.session.request(method, url,
+                                            timeout=self.cfg.timeout, **kwargs)
+                last_exc = None
+            except requests.RequestException as exc:
+                last_exc = exc
+                continue
+            if resp.status_code not in (502, 503, 504):
+                break
+        if last_exc is not None:
+            raise FrappeError(f"Cannot reach Frappe at {url}: {last_exc}") from last_exc
+        assert resp is not None
+        if resp.status_code in (502, 503, 504):
+            raise FrappeError(
+                f"Frappe is temporarily unavailable (HTTP {resp.status_code} "
+                f"after 4 attempts). The site is likely restarting — wait a "
+                "minute and run again; already-synced data is kept."
+            )
         ctype = (resp.headers.get("Content-Type") or "").lower()
         body = resp.text or ""
         looks_html = "html" in ctype or body.lstrip()[:15].lower().startswith(
@@ -64,7 +94,7 @@ class FrappeClient:
         # of printing the whole page.
         if looks_html:
             hint = ""
-            if "press/dashboard" in body or "frappecloud" in body:
+            if resp.status_code < 400 and ("press/dashboard" in body or "frappecloud" in body):
                 hint = (
                     "\n  That is the Frappe Cloud DASHBOARD, not your site.\n"
                     "  In config.toml the url must be your own site, e.g.\n"

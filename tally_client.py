@@ -48,6 +48,31 @@ class TallyConfig:
 # Low-level request plumbing
 # ---------------------------------------------------------------------------
 
+def _decode_response(content: bytes) -> str:
+    """
+    Decode Tally's response bytes without trusting HTTP headers.
+
+    TallyPrime can answer in UTF-8 or UTF-16 and usually omits the charset
+    from Content-Type. Left to its defaults, requests decodes text/* as
+    Latin-1, which does not error — it just turns every multi-byte character
+    into garbage. Order: BOM, XML declaration, UTF-8, then a lossy fallback.
+    """
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return content.decode("utf-16", "replace")
+    if content.startswith(b"\xef\xbb\xbf"):
+        return content[3:].decode("utf-8", "replace")
+    m = re.search(rb'encoding=["\']([A-Za-z0-9_.\-]+)["\']', content[:200])
+    if m:
+        try:
+            return content.decode(m.group(1).decode("ascii"), "replace")
+        except LookupError:
+            pass
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content.decode("cp1252", "replace")
+
+
 def _post(cfg: TallyConfig, xml_body: str) -> str:
     """Send a raw XML envelope to Tally and return the raw XML response."""
     try:
@@ -66,7 +91,11 @@ def _post(cfg: TallyConfig, xml_body: str) -> str:
     if resp.status_code != 200:
         raise TallyError(f"Tally returned HTTP {resp.status_code}: {resp.text[:300]}")
 
-    text = resp.text
+    # Decode explicitly. Tally rarely declares a charset, and requests then
+    # assumes Latin-1 for text/* — which silently mangles every Devanagari
+    # narration and rupee sign into mojibake. Sniff the BOM and the XML
+    # declaration, then default to UTF-8.
+    text = _decode_response(resp.content)
     # Tally returns errors inside the body, not as HTTP codes.
     if "<LINEERROR>" in text:
         # Surface the first line error to make debugging painless.
@@ -155,6 +184,63 @@ def _clean_xml(raw: str) -> str:
     return "".join(out)
 
 
+# A complete tag: optional /, name, attributes (quoted values may hold '>'),
+# optional self-close. Comments/PIs don't match (name must start with a letter).
+_TAG_TOKEN = re.compile(
+    r"<(/?)([A-Za-z_][\w.:-]*)((?:[^<>\"]|\"[^\"<]*\")*?)(/?)>"
+)
+
+
+def _repair_structure(text: str) -> str:
+    """
+    Neutralise narration text that impersonates markup.
+
+    A narration containing "</NARRATION>" or "<ok>" passes every character-
+    level check yet derails the element tree: the fake closer ends the real
+    element early, or the fake opener never closes. Character-by-character
+    repair makes that worse — it eats the REAL tags one letter at a time.
+
+    So repair structurally: walk the tags with a stack; a closer that matches
+    nothing is text (escape it), a closer that matches deeper in the stack
+    means the tags above it are fake openers (escape those). Escaping turns
+    them back into what they are — narration text — and every legitimate
+    element keeps its content.
+    """
+    stack: list = []          # (name, span)
+    to_escape: list = []
+    for m in _TAG_TOKEN.finditer(text):
+        closing, name, self_close = m.group(1), m.group(2), m.group(4)
+        if self_close:
+            continue
+        if not closing:
+            stack.append((name, m.span()))
+        elif stack and stack[-1][0] == name:
+            stack.pop()
+        elif any(n == name for n, _ in stack):
+            while stack and stack[-1][0] != name:
+                to_escape.append(stack.pop()[1])
+            stack.pop()
+        else:
+            to_escape.append(m.span())
+
+    # Leftover openers are fake tags from narrations — unless there are LOTS,
+    # which smells like a truncated response that should fail loudly instead
+    # of parsing with half the data silently missing.
+    if stack and len(stack) <= 20:
+        to_escape.extend(span for _, span in stack)
+
+    if not to_escape:
+        return text
+    parts: list = []
+    prev = 0
+    for a, b in sorted(to_escape):
+        parts.append(text[prev:a])
+        parts.append(text[a:b].replace("<", "&lt;").replace(">", "&gt;"))
+        prev = b
+    parts.append(text[prev:])
+    return "".join(parts)
+
+
 def _parse_xml(raw: str) -> ET.Element:
     """
     Parse Tally's response, surviving garbage _clean_xml didn't anticipate.
@@ -162,9 +248,23 @@ def _parse_xml(raw: str) -> ET.Element:
     If parsing still fails, the offending character (ElementTree reports its
     exact position) is replaced and the parse retried, up to a bounded number
     of times. Losing a character of a narration is acceptable; losing a whole
-    day's voucher export to one byte is not.
+    day's voucher export to one byte is not. Every failure mode raises
+    TallyError, never a raw parser exception, so one bad company cannot abort
+    the others.
     """
-    text = _clean_xml(raw)
+    stripped = raw.lstrip()[:200].lower()
+    if not raw.strip():
+        raise TallyError(
+            "Tally returned an empty response. The company may have been "
+            "closed mid-request, or Tally is still starting up — retry shortly."
+        )
+    if stripped.startswith(("<!doctype", "<html")):
+        raise TallyError(
+            "Port 9000 answered with a web page, not Tally XML. On a shared "
+            "server another program may own the port — check with the provider."
+        )
+
+    text = _repair_structure(_clean_xml(raw))
     repairs = 0
     last_pos = None
     for _ in range(200):
@@ -178,10 +278,10 @@ def _parse_xml(raw: str) -> ET.Element:
         except ET.ParseError as exc:
             lineno, col = getattr(exc, "position", (None, None))
             if lineno is None:
-                raise
+                raise TallyError(f"Tally returned unparseable XML: {exc}") from exc
             lines = text.split("\n")
             if not (1 <= lineno <= len(lines)):
-                raise
+                raise TallyError(f"Tally returned unparseable XML: {exc}") from exc
             line = lines[lineno - 1]
 
             # expat counts columns in UTF-8 BYTES; the string is indexed in
@@ -190,7 +290,12 @@ def _parse_xml(raw: str) -> ET.Element:
             # the real offender survives — the loop then spins in place.
             char_idx = len(line.encode("utf-8")[:col].decode("utf-8", "ignore"))
             if char_idx >= len(line):
-                raise
+                # Blamed past the end of the line: trim its tail so the text
+                # still shrinks, rather than giving up on the whole response.
+                if not line:
+                    raise TallyError(
+                        f"Tally returned unparseable XML: {exc}") from exc
+                char_idx = len(line) - 1
 
             # Deleting (not substituting) guarantees the text shrinks, so the
             # loop must terminate even when the parser keeps blaming the same

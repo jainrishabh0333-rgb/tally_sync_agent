@@ -32,6 +32,7 @@ from frappe_client import FrappeClient, FrappeConfig, FrappeError
 from tally_client import (
     TallyConfig,
     TallyError,
+    _tally_date_to_iso,
     fetch_groups,
     fetch_ledgers,
     fetch_vouchers,
@@ -66,6 +67,7 @@ class Settings:
     chunk_days: int = 31          # export vouchers in chunks to avoid timeouts
     overlap_days: int = 7         # re-pull recent days to catch back-dated edits
     fy_start_month: int = 4       # Indian financial year starts April
+    company_starts: dict = dataclasses.field(default_factory=dict)
 
 
 def _read_toml(cfg_path: Path) -> dict:
@@ -134,6 +136,7 @@ def load_settings(path: Path | None = None) -> Settings:
         url=os.getenv("FRAPPE_URL", f.get("url", "")),
         api_key=os.getenv("FRAPPE_API_KEY", f.get("api_key", "")),
         api_secret=os.getenv("FRAPPE_API_SECRET", f.get("api_secret", "")),
+        timeout=int(f.get("timeout", 180)),
     )
 
     # Multi-company: `companies = [...]` is preferred. A single `company = "..."`
@@ -191,9 +194,22 @@ def resolve_companies(st: Settings) -> list:
     typo surfaces as a warning instead of silently syncing nothing.
     """
     try:
-        open_now = [c["name"] for c in list_companies(st.tally)]
+        infos = list_companies(st.tally)
     except TallyError:
-        open_now = []
+        infos = []
+    open_now = [c["name"] for c in infos]
+    # Each company file covers its own period (books here are one file per
+    # financial year), so remember where each begins.
+    starts = {}
+    for c in infos:
+        raw_start = (c.get("starting_from") or "").strip()
+        if raw_start:
+            try:
+                starts[c["name"]] = datetime.strptime(
+                    _tally_date_to_iso(raw_start), "%Y-%m-%d").date()
+            except ValueError:
+                pass
+    st.company_starts = starts
 
     if not st.companies:
         if not open_now:
@@ -336,8 +352,14 @@ def resolve_range(st: Settings, fc: FrappeClient, args, company: str = "") -> tu
             datetime.strptime(args.frm, "%Y-%m-%d").date(),
             datetime.strptime(args.to, "%Y-%m-%d").date(),
         )
+
+    # These books keep one company file per financial year, so each file's
+    # range must be floored at ITS OWN start — flooring everything at the
+    # current FY would leave every prior-year file permanently empty.
+    floor = st.company_starts.get(company) or fy_start(today, st.fy_start_month)
+
     if args.full:
-        return fy_start(today, st.fy_start_month), today
+        return floor, today
 
     # Incremental: resume from the last synced voucher date, minus an overlap
     # window so back-dated or edited vouchers get picked up again. Each company
@@ -350,10 +372,11 @@ def resolve_range(st: Settings, fc: FrappeClient, args, company: str = "") -> tu
 
     last = state.get("last_voucher_date")
     if last:
-        start = datetime.strptime(last, "%Y-%m-%d").date() - timedelta(days=st.overlap_days)
-        start = max(start, fy_start(today, st.fy_start_month))
+        # Defensive: the server may append a time component.
+        last_date = datetime.strptime(str(last)[:10], "%Y-%m-%d").date()
+        start = max(last_date - timedelta(days=st.overlap_days), floor)
         return start, today
-    return fy_start(today, st.fy_start_month), today
+    return floor, today
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +451,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # Windows consoles default to cp1252; a Hindi ledger name in any print()
+    # would otherwise kill the run with UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     args = build_parser().parse_args()
+
+    if bool(args.frm) != bool(args.to):
+        sys.exit("--from and --to must be given together, both as YYYY-MM-DD.")
+    for label, val in (("--from", args.frm), ("--to", args.to)):
+        if val:
+            try:
+                datetime.strptime(val, "%Y-%m-%d")
+            except ValueError:
+                sys.exit(f"{label} must be YYYY-MM-DD (e.g. 2025-04-01) — got {val!r}")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -464,7 +502,7 @@ def main() -> int:
                 frm, to = resolve_range(st, fc, args, company)
                 counts["vouchers"] = sync_vouchers(st, fc, frm, to)
                 counts["range"] = f"{frm}..{to}"
-        except (TallyError, FrappeError) as exc:
+        except (TallyError, FrappeError, ValueError) as exc:
             # One bad company must not abort the rest.
             log.error("Sync failed for %s: %s", company, exc)
             counts["error"] = str(exc)
