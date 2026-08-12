@@ -45,8 +45,10 @@ api_key = "xxxxxxxxxxxxxxx"
 api_secret = "xxxxxxxxxxxxxxx"
 
 [sync]
-# Vouchers are exported in date chunks so large books don't time out.
-chunk_days = 31
+# Vouchers are exported in date chunks so large books don't time out. A big
+# book (thousands of ledgers) can take minutes for even a month of vouchers,
+# so keep this small. Lower it further if a run reports read timeouts.
+chunk_days = 7
 # On each incremental run, re-pull this many days before the last synced date,
 # so back-dated entries and edits are caught. Tracked per company.
 overlap_days = 7

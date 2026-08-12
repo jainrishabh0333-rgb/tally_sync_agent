@@ -69,7 +69,7 @@ class Settings:
     tally: TallyConfig
     frappe: FrappeConfig
     companies: list = dataclasses.field(default_factory=list)
-    chunk_days: int = 31          # export vouchers in chunks to avoid timeouts
+    chunk_days: int = 7           # export vouchers in chunks to avoid timeouts
     overlap_days: int = 7         # re-pull recent days to catch back-dated edits
     fy_start_month: int = 4       # Indian financial year starts April
     company_starts: dict = dataclasses.field(default_factory=dict)
@@ -183,7 +183,7 @@ def load_settings(path: Path | None = None) -> Settings:
         tally=tally,
         frappe=frappe,
         companies=companies,
-        chunk_days=int(s.get("chunk_days", 31)),
+        chunk_days=int(s.get("chunk_days", 7)),
         overlap_days=int(s.get("overlap_days", 7)),
         fy_start_month=int(s.get("fy_start_month", 4)),
     )

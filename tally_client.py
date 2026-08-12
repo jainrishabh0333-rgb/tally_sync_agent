@@ -1309,6 +1309,9 @@ def _has_any_vouchers(cfg: TallyConfig) -> bool:
     return found
 
 
+_PROBE_FETCH = "<FETCH>Guid,Date</FETCH>"
+
+
 def _probe_variant(cfg: TallyConfig, variant: str) -> str:
     """
     Classify one variant by EXPERIMENT: 'works', 'ignores', 'empty', 'error'.
@@ -1323,17 +1326,28 @@ def _probe_variant(cfg: TallyConfig, variant: str) -> str:
     """
     # Windows must sit INSIDE this company's own book period — a file for
     # 2024-25 holds nothing in 2026, and probing there would prove nothing.
+    #
+    # They must also be TINY. A month of a real book is a heavy export: the
+    # live run spent 90 seconds per shape and timed out on every one, so the
+    # probe learned nothing except that the book is large. A few days answers
+    # the same question — does this shape honour the range — for a fraction
+    # of the work.
     start = _company_start(cfg) or date(date.today().year, 4, 1)
-    windows = [(start, start + timedelta(days=29)),
-               (start + timedelta(days=90), start + timedelta(days=119))]
+    windows = [(start, start + timedelta(days=2)),
+               (start + timedelta(days=45), start + timedelta(days=47))]
     # Probe with a short timeout: a correct one-month request answers quickly,
     # and a shape that hangs is not one worth waiting four minutes to reject.
     probe = TallyConfig(host=cfg.host, port=cfg.port, company=cfg.company,
-                        timeout=min(cfg.timeout, 45))
+                        timeout=min(cfg.timeout, 90))
     seen = []
     for frm, to in windows:
         try:
-            root = _parse_xml(_post(probe, _voucher_request(cfg, frm, to, variant)))
+            body = _voucher_request(cfg, frm, to, variant)
+            # Strip the heavy child-entry fetch: the probe only needs to know
+            # which dates come back, not what is inside each voucher.
+            body = re.sub(r"<FETCH>.*?</FETCH>", _PROBE_FETCH, body, count=1,
+                          flags=re.S)
+            root = _parse_xml(_post(probe, body))
         except TallyError:
             return "error"
         guids, out_of_range = set(), 0
