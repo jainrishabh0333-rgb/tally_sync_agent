@@ -20,6 +20,7 @@ Run:  python test_e2e.py
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -457,6 +458,10 @@ def main() -> int:
         [sys.executable, str(HERE / "sync.py"), "--full",
          "--config", str(workdir / "config.toml")],
         capture_output=True, text=True, timeout=300, cwd=str(workdir),
+        # The mock has no Tally engine to overwhelm, so skip the inter-request
+        # pacing the real server needs. Without this the suite spends minutes
+        # sleeping and creeps up on the timeout above.
+        env={**os.environ, "TALLY_MIN_REQUEST_GAP": "0"},
     )
     out = (proc.stdout or "") + (proc.stderr or "")
 

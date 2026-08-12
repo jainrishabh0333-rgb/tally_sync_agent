@@ -17,7 +17,9 @@ requests, so it can never modify your books. Tally stays the master.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -73,20 +75,49 @@ def _decode_response(content: bytes) -> str:
         return content.decode("cp1252", "replace")
 
 
-def _post(cfg: TallyConfig, xml_body: str) -> str:
+# Tally serves XML from the same single-threaded engine that draws its UI, and
+# a hosted box shares it with live operators. A heavy collection leaves it
+# unable to accept connections for a while — study.py pulled two months of
+# vouchers and every one of the next eighteen requests died on connect, for
+# twelve minutes straight. So: never fire two requests back to back, and treat
+# a refused connection as "busy, ask again" rather than "absent".
+# Overridable so the test mock — which is a local HTTP server with no engine
+# behind it — is not throttled to a crawl for no reason.
+_MIN_REQUEST_GAP = float(os.environ.get("TALLY_MIN_REQUEST_GAP", "1.5"))
+_last_request_at = 0.0
+
+
+def _post(cfg: TallyConfig, xml_body: str, *, attempts: int = 4) -> str:
     """Send a raw XML envelope to Tally and return the raw XML response."""
-    try:
-        resp = requests.post(
-            cfg.url,
-            data=xml_body.encode("utf-8"),
-            headers={"Content-Type": "text/xml; charset=utf-8"},
-            timeout=cfg.timeout,
-        )
-    except requests.RequestException as exc:
-        raise TallyError(
-            f"Could not reach Tally at {cfg.url}. Is TallyPrime running with "
-            f"'act as Server' enabled on port {cfg.port}? ({exc})"
-        ) from exc
+    global _last_request_at
+    delay = 3.0
+    for attempt in range(1, attempts + 1):
+        pause = _MIN_REQUEST_GAP - (time.monotonic() - _last_request_at)
+        if pause > 0:
+            time.sleep(pause)
+        try:
+            resp = requests.post(
+                cfg.url,
+                data=xml_body.encode("utf-8"),
+                headers={"Content-Type": "text/xml; charset=utf-8"},
+                timeout=cfg.timeout,
+            )
+            _last_request_at = time.monotonic()
+            break
+        except requests.RequestException as exc:
+            _last_request_at = time.monotonic()
+            if attempt == attempts:
+                raise TallyError(
+                    f"Could not reach Tally at {cfg.url} after {attempts} "
+                    f"attempts. Tally answers on this port but stops accepting "
+                    f"connections while it digests a large export — if this "
+                    f"persists, reduce sync.chunk_days. ({exc})"
+                ) from exc
+            log.warning("Tally did not answer (attempt %d/%d: %s) — "
+                        "waiting %.0fs and trying again.", attempt, attempts,
+                        type(exc).__name__, delay)
+            time.sleep(delay)
+            delay *= 2
 
     if resp.status_code != 200:
         raise TallyError(f"Tally returned HTTP {resp.status_code}: {resp.text[:300]}")
@@ -1166,6 +1197,20 @@ class Voucher:
     entries: list[VoucherEntry] = field(default_factory=list)
 
 
+# The narrow set study.py proved on TallyPrime Edit Log 7.0. Enough for dates,
+# parties, voucher types and full double-entry lines — so balances reconcile.
+_FIELDS_PROVEN = ("Guid,Date,VoucherTypeName,VoucherNumber,PartyLedgerName,"
+                  "AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,"
+                  "AllLedgerEntries.IsDeemedPositive")
+
+# Everything worth having. Reference/ReferenceDate feed bill allocations and
+# AlterID would enable incremental sync, so this is tried where it works.
+_FIELDS_RICH = ("Guid,Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate,"
+                "Narration,PartyLedgerName,IsInvoice,IsCancelled,AlterID,"
+                "AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,"
+                "AllLedgerEntries.IsDeemedPositive")
+
+
 def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str:
     """
     Build a voucher export in one of several shapes.
@@ -1222,9 +1267,20 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
         else:
             lo, hi = fd, td
         cond = (f'$Date &gt;= $$Date:"{lo}" and $Date &lt;= $$Date:"{hi}"')
-        names = ("TBFltrPeriod" if variant.startswith("filter_plain")
+        # A build that does not recognise one FETCH field answers the whole
+        # collection with zero rows — no error, no clue which field. That is
+        # indistinguishable from "the filter matched nothing", and it is what
+        # sent this agent down the whole-company fallback for two days: the
+        # rich set below differs from the proven one ONLY by Reference,
+        # ReferenceDate, Narration, IsInvoice, IsCancelled and AlterID, and on
+        # TallyPrime Edit Log 7.0 that difference is the whole failure. So the
+        # narrow set that study.py proved is tried FIRST, and the richer one
+        # only as an upgrade on builds that accept it.
+        plain = variant.startswith(("filter_plain", "filter_dotted"))
+        fields = _FIELDS_PROVEN if variant.startswith("filter_dotted") else _FIELDS_RICH
+        names = ("TBFltrPeriod" if plain
                  else "TBFltrPeriod,TBFltrNotCancelled,TBFltrNotOptional")
-        hygiene = ("" if variant.startswith("filter_plain") else
+        hygiene = ("" if plain else
                    '<SYSTEM TYPE="Formulae" NAME="TBFltrNotCancelled">NOT $IsCancelled</SYSTEM>'
                    '<SYSTEM TYPE="Formulae" NAME="TBFltrNotOptional">NOT $IsOptional</SYSTEM>')
         return f"""<ENVELOPE>
@@ -1237,7 +1293,7 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
   <TDL><TDLMESSAGE>
    <COLLECTION NAME="TB_Vouchers" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
     <TYPE>Voucher</TYPE>
-    <FETCH>Guid,Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate,Narration,PartyLedgerName,IsInvoice,IsCancelled,AlterID,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive</FETCH>
+    <FETCH>{fields}</FETCH>
     <FILTER>{names}</FILTER>
    </COLLECTION>
    <SYSTEM TYPE="Formulae" NAME="TBFltrPeriod">{cond}</SYSTEM>
@@ -1269,8 +1325,11 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
 _variant_cache: dict = {}
 _all_cache: dict = {}
 
-# Ordered best-first: precise and cheap before broad and heavy.
-_VARIANTS = ("filter_plain", "filter_plain_dmy", "filter",
+# Ordered best-first: proven before plausible, precise before broad and heavy.
+# filter_dotted is the shape study.py verified against the live server on
+# 2026-08-12 — 4,595 vouchers for April 2026, every one inside the window.
+_VARIANTS = ("filter_dotted", "filter_dotted_dmy",
+             "filter_plain", "filter_plain_dmy", "filter",
              "daybook", "daybook_typed", "register")
 
 
