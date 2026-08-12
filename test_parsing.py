@@ -183,6 +183,32 @@ try:
 except Exception as e:
     check("lone surrogate repaired by backstop", f"raised {type(e).__name__}", "no exception")
 
+print("\nUDF tags — the live 'unparseable' failure (2026-08-11)")
+from tally_client import _flatten_prefixes
+# Tally writes User Defined Fields as <UDF:NAME>, which looks like an XML
+# namespace prefix but is never declared. ElementTree rejected the whole
+# document; the repair loop then ate "<UDF" a letter at a time.
+udf = ('<E><V><GUID>g1</GUID><DATE>20250415</DATE>'
+       '<UDF:CMPGSTREGNUMBER.LIST DESC="`X`" ISLIST="YES" TYPE="String" INDEX="7">'
+       '<UDF:CMPGSTREGNUMBER>27ABLFA2672G1ZD</UDF:CMPGSTREGNUMBER>'
+       '</UDF:CMPGSTREGNUMBER.LIST>'
+       '<AMOUNT>-118000.00</AMOUNT></V></E>')
+r = _parse_xml(udf)
+check("voucher with UDF fields parses", r.findtext("V/GUID"), "g1")
+check("date survives alongside UDF", r.findtext("V/DATE"), "20250415")
+check("amount survives alongside UDF", r.findtext("V/AMOUNT"), "-118000.00")
+check("UDF value preserved",
+      next((e.text for e in r.iter() if e.tag == "UDF_CMPGSTREGNUMBER"), None),
+      "27ABLFA2672G1ZD")
+check("colon flattened, not stripped",
+      _flatten_prefixes("<UDF:A.LIST><UDF:A>v</UDF:A></UDF:A.LIST>"),
+      "<UDF_A.LIST><UDF_A>v</UDF_A></UDF_A.LIST>")
+
+# A tag longer than the old 300-char scan window must still be recognised.
+long_attr = "x" * 800
+big = f'<E><V ATTR="{long_attr}"><GUID>g2</GUID></V></E>'
+check("tag longer than 300 chars still parses", _parse_xml(big).findtext("V/GUID"), "g2")
+
 print("\nsign convention (verified against a live book, 2026-08-10)")
 # TallyPrime exports Debit as NEGATIVE. Confirmed twice against Tally's own
 # Group Summary for SN JAIN INDUSTRIES PVT LTD - (26-27):

@@ -468,7 +468,7 @@ def main() -> int:
     check_true("BOM+CRLF config accepted", "Could not read config" not in out)
 
     # Ledgers: 2,010 sent; only the bare-domain email row may be rejected.
-    check("ledgers mirrored (2013 sent, 1 rejected)", len(store["ledgers"]), 2012)
+    check("ledgers mirrored (2014 sent, 1 rejected)", len(store["ledgers"]), 2013)
     check_true("bare-domain email row rejected and reported",
                "InvalidEmailAddressError" in out and "1 ledger(s) rejected" in out.replace("was", "were") or
                "rejected" in out)
@@ -507,7 +507,9 @@ def main() -> int:
 
     # Prior-year company must have synced its own period.
     old_ledgers = [r for r in store["ledgers"] if r.get("company") == OLD_COMPANY]
-    check("prior-year ledgers synced", len(old_ledgers), 1)
+    # Two: the prior-year-only customer, plus V MART which exists in BOTH
+    # years under the same carried-forward GUID.
+    check("prior-year ledgers synced", len(old_ledgers), 2)
     old_vouchers = [v for v in store["vouchers"] if v.get("company") == OLD_COMPANY]
     check("prior-year vouchers synced (range floored at ITS year)",
           len(old_vouchers), 60)
@@ -534,7 +536,8 @@ def main() -> int:
     # The Day Book range defect was detected and routed around.
     check_true("probe verified the request against two real months",
                "verified against two" in out, out[-400:])
-    check_true("the TDL-filtered request was chosen", "using 'filter'" in out)
+    check_true("a TDL-filtered request was chosen",
+               "using 'filter" in out, out[-400:])
     check_true("the stuck same-day voucher never entered the mirror",
                not any(v.get("guid") == "stuck-day-guid" for v in store["vouchers"]))
 

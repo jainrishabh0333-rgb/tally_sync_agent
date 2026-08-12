@@ -119,9 +119,15 @@ _VALID_NUMERIC = re.compile(r"&#(x[0-9a-fA-F]+|[0-9]+)$")
 # name (letters, digits, dots, colons, hyphens, underscores — ALLLEDGERENTRIES.LIST,
 # UDF:_UDF_FIELD), optionally attributes with double-quoted values, optional
 # self-close. Anything else is narration text wearing angle brackets.
+# How far ahead to look for a tag's closing '>', and how many candidate
+# closers to try. Both were far too small: real Tally tags carry UDF
+# attributes that run past 300 characters.
+_TAG_SCAN = 4000
+_TAG_CLOSER_TRIES = 40
+
 _TAG_SHAPE = re.compile(
     r"^/?[A-Za-z_][\w.:-]*"                       # element name
-    r"(\s+[A-Za-z_][\w.:-]*\s*=\s*\"[^\"<]*\")*"   # attributes; '>' may occur in a value
+    r"(\s+[A-Za-z_][\w.:-]*\s*=\s*\"[^\"]*\")*"     # attributes; value may hold > or <
     r"\s*/?$"
     r"|^[!?].*$"                                   # <?xml ...?>, <!-- -->
 )
@@ -166,17 +172,26 @@ def _clean_xml(raw: str) -> str:
             # Narrations contain things like "rate < 500", "<- pending" and
             # "<PONO 123>" — the last LOOKS tag-like but has an attribute
             # starting with a digit, which no repair-by-character can fix.
+            # The scan window must be generous. Tally emits User Defined Field
+            # tags that run to several hundred characters:
+            #   <UDF:CMPGSTREGNUMBER.LIST DESC="`CMPGSTREGNUMBER`" ISLIST="YES"
+            #    TYPE="String" INDEX="7">
+            # A short window makes the closing '>' invisible, the tag gets
+            # escaped as text, and the repair loop then eats "<UDF" one letter
+            # at a time until the whole document is unparseable — which is
+            # exactly what happened on the live book.
+            #
             # An attribute value may itself contain '>' (a ledger named
             # "A > B"), so try successive candidate closers before giving up.
             kept = False
-            close = raw.find(">", i + 1, i + 300)
-            for _ in range(5):
+            close = raw.find(">", i + 1, i + _TAG_SCAN)
+            for _ in range(_TAG_CLOSER_TRIES):
                 if close == -1:
                     break
                 if _TAG_SHAPE.match(raw[i + 1:close]):
                     kept = True
                     break
-                close = raw.find(">", close + 1, i + 300)
+                close = raw.find(">", close + 1, i + _TAG_SCAN)
             out.append(ch if kept else "&lt;")
         else:
             out.append(ch)
@@ -241,6 +256,24 @@ def _repair_structure(text: str) -> str:
     return "".join(parts)
 
 
+# Tally emits User Defined Fields as <UDF:FIELDNAME>, which LOOKS like an XML
+# namespace prefix but is never declared. ElementTree rejects the entire
+# document with "unbound prefix", and a character-level repair then eats the
+# tag one letter at a time until nothing parses — the exact failure seen on
+# the live book. These are not namespaces, so the colon is simply flattened.
+_PREFIXED_TAG = re.compile(r"(</?)([A-Za-z_][\w.-]*):([A-Za-z_][\w.-]*)")
+
+
+def _flatten_prefixes(text: str) -> str:
+    """Turn <UDF:NAME> into <UDF_NAME> so ElementTree will accept it."""
+    prev = None
+    # Repeat: a tag may carry more than one colon (UDF:A:B).
+    while prev != text:
+        prev = text
+        text = _PREFIXED_TAG.sub(r"\1\2_\3", text)
+    return text
+
+
 def _parse_xml(raw: str) -> ET.Element:
     """
     Parse Tally's response, surviving garbage _clean_xml didn't anticipate.
@@ -264,7 +297,7 @@ def _parse_xml(raw: str) -> ET.Element:
             "server another program may own the port — check with the provider."
         )
 
-    text = _repair_structure(_clean_xml(raw))
+    text = _repair_structure(_flatten_prefixes(_clean_xml(raw)))
     repairs = 0
     last_pos = None
     for _ in range(200):
