@@ -40,8 +40,8 @@ Usage
     python order_importer.py                       # one pass and exit
     python order_importer.py --company "NAME"      # only this company's orders
 Config: config.toml (same file as sync.py), optional [orders] section:
-    godown = "Any"        # godown name on every batch line
-    poll   = false        # true = keep running, drain the queue every 60s
+    sales_ledger = "Sale Central 5%"   # accounting allocation on each line
+    poll         = false   # true = keep running, drain the queue every 60s
 
 Expected order shape from Frappe (tally_bridge.api.pending_sales_orders):
     {"order_key": "...", "order_no": "...", "company": "...", "party": "...",
@@ -96,7 +96,10 @@ class OrderDataError(ValueError):
 
 @dataclasses.dataclass
 class OrderSettings:
-    godown: str = "Any"
+    # The zero-amount accounting allocation each order line carries — every
+    # operator-entered specimen names one. Staff correct it while pricing if
+    # a party needs the Local ledger instead.
+    sales_ledger: str = "Sale Central 5%"
     poll: bool = False
 
 
@@ -108,7 +111,8 @@ def load_order_settings(path: Path | None = None) -> OrderSettings:
         data = sync._read_toml(cfg_path)
     o = data.get("orders", {}) or {}
     return OrderSettings(
-        godown=str(o.get("godown", "Any")).strip() or "Any",
+        sales_ledger=(str(o.get("sales_ledger", "Sale Central 5%")).strip()
+                      or "Sale Central 5%"),
         poll=bool(o.get("poll", False)),
     )
 
@@ -306,21 +310,46 @@ def _assert_sales_order(xml: str) -> None:
             f"{ALLOWED_VCHTYPE!r} voucher (VCHTYPE={kinds!r}, "
             f"VOUCHERTYPENAME={names!r})."
         )
-    for banned in ("<RATE>", "<AMOUNT>", "<MRP", "LEDGERENTRIES"):
+    for banned in ("<RATE>", "<MRP", "<DISCOUNT>"):
         if banned in xml:
             raise RuntimeError(
                 f"SAFETY: refusing to send — envelope contains {banned!r}; "
                 "this flow is quantity-only."
             )
+    # Ledger lines ARE present — a real order carries the party line and a
+    # sales-ledger allocation, and Tally parks the voucher in Import
+    # Exceptions without them (learned from 22 exported specimens). The
+    # money guarantee moves to the amounts themselves: every AMOUNT in the
+    # envelope must be exactly zero.
+    nonzero = [a for a in re.findall(r"<AMOUNT>([^<]*)</AMOUNT>", xml)
+               if a.strip() not in ("0", "0.00")]
+    if nonzero:
+        raise RuntimeError(
+            f"SAFETY: refusing to send — non-zero AMOUNT(s) {nonzero!r}; "
+            "this flow is quantity-only."
+        )
 
 
-def build_envelope(o: dict, godown: str) -> str:
+def _due_literal(d: "date") -> str:
+    """Due dates as Tally itself writes them in orders: 1-Sep-26, 12-Aug-26."""
+    return f"{d.day}-{d.strftime('%b-%y')}"
+
+
+def build_envelope(o: dict, sales_ledger: str) -> str:
     """
-    Import envelope for ONE sales order — quantity-only.
+    Import envelope for ONE sales order — quantity-only, shaped to match how
+    THIS Tally serialises operator-entered orders (22 live specimens,
+    exported 2026-08-13, sample_orders.xml):
 
-    One ALLINVENTORYENTRIES.LIST per style line; each size is a
-    BATCHALLOCATIONS.LIST under it (BATCHNAME is the size, with its own
-    ORDERDUEDATE). Deliberately absent: RATE, MRP, AMOUNT, ledger entries.
+    - NO GODOWNNAME anywhere. The order screen's "Any" is the ABSENCE of a
+      godown, not a godown named "Any" — writing one parked the first import
+      in Import Exceptions.
+    - Each BATCHALLOCATIONS.LIST (BATCHNAME = size) carries ORDERNO and its
+      own ORDERDUEDATE, written as d-MMM-yy exactly as the specimens show.
+    - Each inventory line carries an ACCOUNTINGALLOCATIONS.LIST naming the
+      sales ledger, and the voucher carries the party LEDGERENTRIES.LIST —
+      both present in every specimen. Quantity-only means their AMOUNTs are
+      zero (staff price the order in Tally), not that they are absent.
     """
     esc = _xml_escape
     d = _fmt_date(o["order_date"])
@@ -329,15 +358,16 @@ def build_envelope(o: dict, godown: str) -> str:
     for ln in o["lines"]:
         batches = []
         for sz in ln["sizes"]:
-            due = _fmt_date(o["order_date"] + timedelta(days=sz["due_days"]))
+            due = _due_literal(o["order_date"] + timedelta(days=sz["due_days"]))
             q = _fmt_qty(sz["qty"], ln["unit"])
             batches.append(
                 "    <BATCHALLOCATIONS.LIST>\n"
                 f"     <BATCHNAME>{esc(sz['size'])}</BATCHNAME>\n"
-                f"     <GODOWNNAME>{esc(godown)}</GODOWNNAME>\n"
-                f"     <ORDERDUEDATE TYPE=\"Date\">{due}</ORDERDUEDATE>\n"
+                f"     <ORDERNO>{esc(o['order_no'])}</ORDERNO>\n"
+                "     <AMOUNT>0</AMOUNT>\n"
                 f"     <ACTUALQTY>{q}</ACTUALQTY>\n"
                 f"     <BILLEDQTY>{q}</BILLEDQTY>\n"
+                f"     <ORDERDUEDATE>{due}</ORDERDUEDATE>\n"
                 "    </BATCHALLOCATIONS.LIST>"
             )
         lq = _fmt_qty(ln["qty"], ln["unit"])
@@ -345,9 +375,16 @@ def build_envelope(o: dict, godown: str) -> str:
             "   <ALLINVENTORYENTRIES.LIST>\n"
             f"    <STOCKITEMNAME>{esc(ln['item'])}</STOCKITEMNAME>\n"
             "    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n"
+            "    <AMOUNT>0</AMOUNT>\n"
             f"    <ACTUALQTY>{lq}</ACTUALQTY>\n"
             f"    <BILLEDQTY>{lq}</BILLEDQTY>\n"
             + "\n".join(batches) + "\n"
+            "    <ACCOUNTINGALLOCATIONS.LIST>\n"
+            f"     <LEDGERNAME>{esc(sales_ledger)}</LEDGERNAME>\n"
+            "     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n"
+            "     <ISPARTYLEDGER>No</ISPARTYLEDGER>\n"
+            "     <AMOUNT>0</AMOUNT>\n"
+            "    </ACCOUNTINGALLOCATIONS.LIST>\n"
             "   </ALLINVENTORYENTRIES.LIST>"
         )
 
@@ -367,8 +404,18 @@ def build_envelope(o: dict, godown: str) -> str:
         f"   <REFERENCE>{esc(o['order_key'])}</REFERENCE>\n"
         f"   <PARTYLEDGERNAME>{esc(o['party'])}</PARTYLEDGERNAME>\n"
         f"   <PARTYNAME>{esc(o['party'])}</PARTYNAME>\n"
-        "   <ISINVOICE>No</ISINVOICE>\n"
+        f"   <BASICBASEPARTYNAME>{esc(o['party'])}</BASICBASEPARTYNAME>\n"
+        f"   <BASICBUYERNAME>{esc(o['party'])}</BASICBUYERNAME>\n"
+        "   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>\n"
+        f"   <NARRATION>Queued from photographed order via Claude "
+        f"({esc(o['order_key'])}); quantities only, to be priced.</NARRATION>\n"
         + "\n".join(inv) + "\n"
+        "   <LEDGERENTRIES.LIST>\n"
+        f"    <LEDGERNAME>{esc(o['party'])}</LEDGERNAME>\n"
+        "    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>\n"
+        "    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>\n"
+        "    <AMOUNT>0</AMOUNT>\n"
+        "   </LEDGERENTRIES.LIST>\n"
         "  </VOUCHER>\n"
         "  </TALLYMESSAGE></DATA></BODY></ENVELOPE>"
     )
@@ -541,7 +588,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             # Build and PRINT, send nothing, change no status. Validation
             # still runs when Tally is reachable so the first real order can
             # be eyeballed together with what would happen to it.
-            xml = build_envelope(o, ocfg.godown)
+            xml = build_envelope(o, ocfg.sales_ledger)
             if _company_open(cfg, o["company"], open_cache):
                 try:
                     parties, items = _masters(cfg, o["company"], masters_cache)
@@ -576,6 +623,17 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             skipped += 1
             continue
 
+        # The configured sales ledger is a name going into the import too —
+        # subject to the same auto-create hazard as party and items. A miss
+        # is a CONFIG error, not an order error: leave the order Pending and
+        # tell the operator to fix config.toml.
+        if ocfg.sales_ledger not in parties:
+            log.error("Order %s left Pending — [orders].sales_ledger %r does "
+                      "not exist as a ledger in %r. Fix config.toml.",
+                      key, ocfg.sales_ledger, o["company"])
+            skipped += 1
+            continue
+
         err = validate_masters(o, parties, items)
         if err:
             log.error("Order %s: %s", key, err)
@@ -583,7 +641,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             failed += 1
             continue
 
-        xml = build_envelope(o, ocfg.godown)
+        xml = build_envelope(o, ocfg.sales_ledger)
         outcome = import_order(fc, cfg, o, xml)
         imported += outcome == "imported"
         failed += outcome == "failed"
@@ -609,6 +667,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--company", metavar="NAME", default=None,
                    help="only process orders for this company "
                         "(exact Tally name)")
+    p.add_argument("--retry", metavar="ORDER_KEY", default=None,
+                   help="move ONE Failed order back to Pending first, then "
+                        "run the normal pass. Only do this after checking in "
+                        "Tally that the order did not actually import.")
     p.add_argument("--config", type=Path, default=None)
     p.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -633,6 +695,18 @@ def main() -> int:
     st = sync.load_settings(args.config)
     ocfg = load_order_settings(args.config)
     fc = FrappeClient(st.frappe)
+
+    if args.retry:
+        # Failed -> Pending is a transition the queue reserves for an explicit
+        # human decision, because a Failed order whose response was lost may
+        # ALREADY be inside Tally. The flag is that decision, made typed-out.
+        try:
+            fc.mark_order_result(args.retry.strip(), "Pending")
+            log.info("Order %s moved back to Pending for this run.",
+                     args.retry.strip())
+        except FrappeError as exc:
+            log.error("Could not re-queue %s: %s", args.retry, exc)
+            return 1
 
     if args.dry_run:
         log.info("DRY RUN — envelopes are printed, nothing is sent, no "
