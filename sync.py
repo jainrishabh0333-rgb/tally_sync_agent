@@ -201,19 +201,28 @@ def learn_company_starts(st: Settings) -> list:
     """
     try:
         infos = list_companies(st.tally)
-    except TallyError:
+    except TallyError as exc:
+        # Never silent. Tally refusing connections while it digests a big
+        # export is routine here, and swallowing it left company_starts empty
+        # — which silently restores the very wrong-window bug this function
+        # exists to prevent.
+        log.warning("Could not list companies (%s) — each file's own start "
+                    "date is unknown for this run.", exc)
         infos = []
     # Each company file covers its own period (books here are one file per
     # financial year), so remember where each begins.
     starts = {}
     for c in infos:
         raw_start = (c.get("starting_from") or "").strip()
-        if raw_start:
-            try:
-                starts[c["name"]] = datetime.strptime(
-                    _tally_date_to_iso(raw_start), "%Y-%m-%d").date()
-            except ValueError:
-                pass
+        if not raw_start:
+            log.warning("Tally reported no start date for %r.", c["name"])
+            continue
+        try:
+            starts[c["name"]] = datetime.strptime(
+                _tally_date_to_iso(raw_start), "%Y-%m-%d").date()
+        except ValueError:
+            log.warning("Could not read the start date %r for %r.",
+                        raw_start, c["name"])
     st.company_starts = starts
     return [c["name"] for c in infos]
 
@@ -422,16 +431,26 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     # Push in batches so a huge chart of accounts doesn't blow the request size.
     pushed = 0
     rejected = 0
+    pruned = 0
     for i in range(0, len(payload), 500):
         batch = payload[i:i + 500]
         res = fc.upsert_ledgers(batch) or {}
         msg = res.get("message", res) if isinstance(res, dict) else {}
         rejected += _report_rejects(msg, "ledger")
+        pruned += int(msg.get("pruned_duplicates") or 0)
         pushed += len(batch)
         log.info("  ledgers %d/%d", pushed, len(payload))
     if rejected:
         log.warning("%d ledger(s) were rejected by Frappe and NOT mirrored "
                     "(details above). The rest synced normally.", rejected)
+    if pruned:
+        # Deleting rows from the live mirror must never be silent. Frappe
+        # prunes a duplicate ledger generation in place; without this line the
+        # run would report plain success while thousands of rows disappeared.
+        log.warning("Removed %d duplicate ledger row(s) left behind by an "
+                    "earlier docname change — the mirror repaired itself. "
+                    "Balances that read about double should now be correct.",
+                    pruned)
     return pushed - rejected
 
 
@@ -466,10 +485,31 @@ def resolve_range(st: Settings, fc: FrappeClient, args, company: str = "") -> tu
     # These books keep one company file per financial year, so each file's
     # range must be floored at ITS OWN start — flooring everything at the
     # current FY would leave every prior-year file permanently empty.
-    floor = st.company_starts.get(company) or fy_start(today, st.fy_start_month)
+    book_start = st.company_starts.get(company)
+    floor = book_start or fy_start(today, st.fy_start_month)
+
+    # A one-year file's window must also be CAPPED at its year end. Without
+    # the cap, --full on a 2022-23 file chunks week by week all the way to
+    # today — hundreds of exports for dates its books cannot contain, against
+    # a Tally that stops answering under load and is known to leak rows
+    # across range boundaries on out-of-period requests.
+    ceiling = today
+    if book_start:
+        book_end = (date(book_start.year + 1, book_start.month, book_start.day)
+                    - timedelta(days=1))
+        if book_end < today:
+            ceiling = book_end
 
     if args.full:
-        return floor, today
+        if book_start is None:
+            # Guessing here is how a 2022-23 file gets asked for 2026 dates,
+            # mirrors nothing, and still logs Success.
+            sys.exit(
+                f"Tally did not report a start date for {company!r}, so a "
+                "--full window cannot be trusted. Re-run when Tally is "
+                "responsive, or give the range explicitly with --from/--to."
+            )
+        return floor, ceiling
 
     # Incremental: resume from the last synced voucher date, minus an overlap
     # window so back-dated or edited vouchers get picked up again. Each company
@@ -485,8 +525,8 @@ def resolve_range(st: Settings, fc: FrappeClient, args, company: str = "") -> tu
         # Defensive: the server may append a time component.
         last_date = datetime.strptime(str(last)[:10], "%Y-%m-%d").date()
         start = max(last_date - timedelta(days=st.overlap_days), floor)
-        return start, today
-    return floor, today
+        return start, ceiling
+    return floor, ceiling
 
 
 # ---------------------------------------------------------------------------
@@ -601,10 +641,22 @@ def main() -> int:
         # that is the only place they were recorded. See learn_company_starts.
         open_now = learn_company_starts(st)
         if open_now and args.company not in open_now:
+            # Record the failure in Frappe before exiting: an unattended run
+            # that dies only to stderr leaves sync_health reporting the stale
+            # Success forever. The names are printed !r so an invisible
+            # whitespace difference from what the operator typed shows up.
+            try:
+                fc.log_sync("Failed", {
+                    "company": args.company,
+                    "error": "Not open in Tally. Open: "
+                             + ", ".join(repr(c) for c in open_now),
+                })
+            except FrappeError:
+                pass  # the exit message below still tells the operator
             sys.exit(
                 f"{args.company!r} is not open in Tally, so it would sync "
                 f"nothing and still report success.\n"
-                "Open in Tally: " + ", ".join(open_now)
+                "Open in Tally: " + ", ".join(repr(c) for c in open_now)
             )
         companies = [args.company]
     else:

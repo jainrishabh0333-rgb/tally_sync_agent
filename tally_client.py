@@ -1566,7 +1566,11 @@ def list_companies(cfg: TallyConfig) -> list[dict[str, Any]]:
     root = _parse_xml(raw)
     companies = []
     for el in root.iter("COMPANY"):
-        name = el.get("NAME") or _text(el.find("NAME"))
+        # Strip: the NAME attribute comes straight from Tally's XML and a
+        # trailing space here makes every exact-match comparison downstream
+        # fail invisibly — the error message prints a name character-identical
+        # to what the operator typed.
+        name = (el.get("NAME") or _text(el.find("NAME")) or "").strip()
         if name:
             companies.append({"name": name, "starting_from": _text(el.find("STARTINGFROM"))})
     return companies
