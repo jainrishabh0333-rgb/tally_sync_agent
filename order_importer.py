@@ -100,6 +100,12 @@ class OrderSettings:
     # operator-entered specimen names one. Staff correct it while pricing if
     # a party needs the Local ledger instead.
     sales_ledger: str = "Sale Central 5%"
+    # The company GST registration every voucher must bind to — this company
+    # runs MULTIPLE registrations and every specimen names one. Constants
+    # from the live specimens; override in [orders] if the company ever
+    # changes registration.
+    gst_registration: str = "Uttar Pradesh Registration"
+    cmp_gstin: str = "09ABHCS0526J1Z7"
     poll: bool = False
 
 
@@ -113,6 +119,11 @@ def load_order_settings(path: Path | None = None) -> OrderSettings:
     return OrderSettings(
         sales_ledger=(str(o.get("sales_ledger", "Sale Central 5%")).strip()
                       or "Sale Central 5%"),
+        gst_registration=(str(o.get("gst_registration",
+                                    "Uttar Pradesh Registration")).strip()
+                          or "Uttar Pradesh Registration"),
+        cmp_gstin=(str(o.get("cmp_gstin", "09ABHCS0526J1Z7")).strip()
+                   or "09ABHCS0526J1Z7"),
         poll=bool(o.get("poll", False)),
     )
 
@@ -330,12 +341,34 @@ def _assert_sales_order(xml: str) -> None:
         )
 
 
+# First two digits of a GSTIN are the state code. Needed because every real
+# voucher in this book carries PLACEOFSUPPLY and party state, and this company
+# runs MULTIPLE GST registrations — vouchers must be locatable.
+_GST_STATES = {
+    "01": "Jammu & Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
+    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
+    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+    "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam",
+    "19": "West Bengal", "20": "Jharkhand", "21": "Odisha",
+    "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+    "26": "Dadra & Nagar Haveli and Daman & Diu", "27": "Maharashtra",
+    "29": "Karnataka", "30": "Goa", "31": "Lakshadweep", "32": "Kerala",
+    "33": "Tamil Nadu", "34": "Puducherry", "35": "Andaman & Nicobar Islands",
+    "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh",
+}
+
+
+def _state_from_gstin(gstin: str) -> str:
+    return _GST_STATES.get((gstin or "")[:2], "")
+
+
 def _due_literal(d: "date") -> str:
     """Due dates as Tally itself writes them in orders: 1-Sep-26, 12-Aug-26."""
     return f"{d.day}-{d.strftime('%b-%y')}"
 
 
-def build_envelope(o: dict, sales_ledger: str) -> str:
+def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str) -> str:
     """
     Import envelope for ONE sales order — quantity-only, shaped to match how
     THIS Tally serialises operator-entered orders (22 live specimens,
@@ -380,7 +413,7 @@ def build_envelope(o: dict, sales_ledger: str) -> str:
             f"    <BILLEDQTY>{lq}</BILLEDQTY>\n"
             + "\n".join(batches) + "\n"
             "    <ACCOUNTINGALLOCATIONS.LIST>\n"
-            f"     <LEDGERNAME>{esc(sales_ledger)}</LEDGERNAME>\n"
+            f"     <LEDGERNAME>{esc(ocfg.sales_ledger)}</LEDGERNAME>\n"
             "     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n"
             "     <LEDGERFROMITEM>No</LEDGERFROMITEM>\n"
             # The line every specimen carries and the first two imports left
@@ -415,7 +448,24 @@ def build_envelope(o: dict, sales_ledger: str) -> str:
         f"   <BASICBASEPARTYNAME>{esc(o['party'])}</BASICBASEPARTYNAME>\n"
         f"   <BASICBUYERNAME>{esc(o['party'])}</BASICBUYERNAME>\n"
         "   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>\n"
-        f"   <NARRATION>Queued from photographed order via Claude "
+        # Present in EVERY operator-entered specimen and absent from the
+        # first three attempts. This company runs multiple GST registrations
+        # (tax units), and TallyPrime 3+ requires each voucher to bind to
+        # one; the voucher-number series and manual numbering style likewise.
+        "   <ISINVOICE>No</ISINVOICE>\n"
+        "   <NUMBERINGSTYLE>Manual</NUMBERINGSTYLE>\n"
+        "   <VOUCHERNUMBERSERIES>Default</VOUCHERNUMBERSERIES>\n"
+        f"   <GSTREGISTRATION TAXTYPE=\"GST\" "
+        f"TAXREGISTRATION=\"{esc(ocfg.cmp_gstin)}\">"
+        f"{esc(ocfg.gst_registration)}</GSTREGISTRATION>\n"
+        f"   <CMPGSTIN>{esc(ocfg.cmp_gstin)}</CMPGSTIN>\n"
+        f"   <EFFECTIVEDATE>{d}</EFFECTIVEDATE>\n"
+        + (f"   <PARTYGSTIN>{esc(party_gstin)}</PARTYGSTIN>\n" if party_gstin else "")
+        + (f"   <PLACEOFSUPPLY>{esc(_state_from_gstin(party_gstin))}</PLACEOFSUPPLY>\n"
+           f"   <STATENAME>{esc(_state_from_gstin(party_gstin))}</STATENAME>\n"
+           f"   <CONSIGNEESTATENAME>{esc(_state_from_gstin(party_gstin))}</CONSIGNEESTATENAME>\n"
+           if _state_from_gstin(party_gstin) else "")
+        + f"   <NARRATION>Queued from photographed order via Claude "
         f"({esc(o['order_key'])}); quantities only, to be priced.</NARRATION>\n"
         + "\n".join(inv) + "\n"
         "   <LEDGERENTRIES.LIST>\n"
@@ -469,14 +519,16 @@ def _company_open(cfg, company: str, cache: dict) -> bool:
 
 
 def _masters(cfg, company: str, cache: dict) -> tuple:
-    """(party names, item names) for a company — fetched ONCE per run."""
+    """(party names, item names, party->gstin) — fetched ONCE per run."""
     if company not in cache:
         cfg.company = company
-        parties = {l.name for l in fetch_ledgers(cfg)}
+        ledgers = fetch_ledgers(cfg)
+        parties = {l.name for l in ledgers}
+        gstins = {l.name: (l.gstin or "").strip() for l in ledgers}
         items = {i.name for i in fetch_stock_items(cfg, date.today())}
         log.info("Cached masters for %r: %d ledgers, %d stock items.",
                  company, len(parties), len(items))
-        cache[company] = (parties, items)
+        cache[company] = (parties, items, gstins)
     return cache[company]
 
 
@@ -608,10 +660,11 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             # Build and PRINT, send nothing, change no status. Validation
             # still runs when Tally is reachable so the first real order can
             # be eyeballed together with what would happen to it.
-            xml = build_envelope(o, ocfg.sales_ledger)
+            party_gstin = ""
             if _company_open(cfg, o["company"], open_cache):
                 try:
-                    parties, items = _masters(cfg, o["company"], masters_cache)
+                    parties, items, gstins = _masters(cfg, o["company"], masters_cache)
+                    party_gstin = gstins.get(o["party"], "")
                     err = validate_masters(o, parties, items)
                     if err:
                         log.warning("Order %s WOULD FAIL: %s", key, err)
@@ -624,6 +677,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
                     skipped += 1
             else:
                 skipped += 1
+            xml = build_envelope(o, ocfg, party_gstin)
             print(f"--- DRY RUN — {key} ({o['company']}) ---")
             print(xml)
             print()
@@ -636,7 +690,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             continue
 
         try:
-            parties, items = _masters(cfg, o["company"], masters_cache)
+            parties, items, gstins = _masters(cfg, o["company"], masters_cache)
         except TallyError as exc:
             log.warning("Order %s: cannot read masters for %r (%s) — leaving "
                         "it Pending.", key, o["company"], exc)
@@ -661,7 +715,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             failed += 1
             continue
 
-        xml = build_envelope(o, ocfg.sales_ledger)
+        xml = build_envelope(o, ocfg, gstins.get(o["party"], ""))
         outcome = import_order(fc, cfg, o, xml)
         imported += outcome == "imported"
         failed += outcome == "failed"
