@@ -1368,9 +1368,6 @@ def _has_any_vouchers(cfg: TallyConfig) -> bool:
     return found
 
 
-_PROBE_FETCH = "<FETCH>Guid,Date</FETCH>"
-
-
 def _probe_variant(cfg: TallyConfig, variant: str) -> str:
     """
     Classify one variant by EXPERIMENT: 'works', 'ignores', 'empty', 'error'.
@@ -1401,11 +1398,15 @@ def _probe_variant(cfg: TallyConfig, variant: str) -> str:
     seen = []
     for frm, to in windows:
         try:
+            # Probe with the EXACT request the sync will send. This used to
+            # substitute a slim <FETCH>Guid,Date</FETCH> to save bandwidth,
+            # which quietly made the probe test a different request from the
+            # one it was choosing between: against the live server the slim
+            # form returns nothing at all, while the full field list returns
+            # the whole month correctly. Every shape was therefore rejected on
+            # evidence that did not apply to it. The windows below are three
+            # days wide, so the fields cost little and prove much more.
             body = _voucher_request(cfg, frm, to, variant)
-            # Strip the heavy child-entry fetch: the probe only needs to know
-            # which dates come back, not what is inside each voucher.
-            body = re.sub(r"<FETCH>.*?</FETCH>", _PROBE_FETCH, body, count=1,
-                          flags=re.S)
             root = _parse_xml(_post(probe, body))
         except TallyError:
             return "error"
