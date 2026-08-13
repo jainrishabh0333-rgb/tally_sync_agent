@@ -368,7 +368,8 @@ def _due_literal(d: "date") -> str:
     return f"{d.day}-{d.strftime('%b-%y')}"
 
 
-def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str) -> str:
+def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
+                   optional: bool = False) -> str:
     """
     Import envelope for ONE sales order — quantity-only, shaped to match how
     THIS Tally serialises operator-entered orders (22 live specimens,
@@ -453,7 +454,12 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str) -> str:
         # (tax units), and TallyPrime 3+ requires each voucher to bind to
         # one; the voucher-number series and manual numbering style likewise.
         "   <ISINVOICE>No</ISINVOICE>\n"
-        "   <NUMBERINGSTYLE>Manual</NUMBERINGSTYLE>\n"
+        # Optional = Tally's own draft state: the voucher exists, holds its
+        # lines, affects nothing anywhere — not even the order book — until
+        # a human regularises it. Import validation is laxer for drafts,
+        # which is exactly the property a zero-value order needs.
+        + ("   <ISOPTIONAL>Yes</ISOPTIONAL>\n" if optional else "")
+        + "   <NUMBERINGSTYLE>Manual</NUMBERINGSTYLE>\n"
         "   <VOUCHERNUMBERSERIES>Default</VOUCHERNUMBERSERIES>\n"
         f"   <GSTREGISTRATION TAXTYPE=\"GST\" "
         f"TAXREGISTRATION=\"{esc(ocfg.cmp_gstin)}\">"
@@ -677,7 +683,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
                     skipped += 1
             else:
                 skipped += 1
-            xml = build_envelope(o, ocfg, party_gstin)
+            xml = build_envelope(o, ocfg, party_gstin, args.optional)
             print(f"--- DRY RUN — {key} ({o['company']}) ---")
             print(xml)
             print()
@@ -715,7 +721,7 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             failed += 1
             continue
 
-        xml = build_envelope(o, ocfg, gstins.get(o["party"], ""))
+        xml = build_envelope(o, ocfg, gstins.get(o["party"], ""), args.optional)
         outcome = import_order(fc, cfg, o, xml)
         imported += outcome == "imported"
         failed += outcome == "failed"
@@ -741,6 +747,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--company", metavar="NAME", default=None,
                    help="only process orders for this company "
                         "(exact Tally name)")
+    p.add_argument("--optional", action="store_true",
+                   help="import as an OPTIONAL (draft) voucher — posts even "
+                        "less than a Sales Order (nothing at all, not even "
+                        "into order books) until staff regularise it in "
+                        "Tally. The escape hatch if Tally refuses zero-value "
+                        "regular orders.")
     p.add_argument("--retry", metavar="ORDER_KEY", default=None,
                    help="move ONE Failed order back to Pending first, then "
                         "run the normal pass. Only do this after checking in "
