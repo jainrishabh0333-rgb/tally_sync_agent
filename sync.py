@@ -189,20 +189,20 @@ def load_settings(path: Path | None = None) -> Settings:
     )
 
 
-def resolve_companies(st: Settings) -> list:
+def learn_company_starts(st: Settings) -> list:
     """
-    Decide which companies to sync.
+    Record where each open company file's books begin; return what is open.
 
-    An empty `companies` list means "whatever is open in Tally right now",
-    which is the friendliest default on a server where companies come and go.
-    Configured names are checked against what Tally actually has open so a
-    typo surfaces as a warning instead of silently syncing nothing.
+    Split out of resolve_companies because it is a side effect that EVERY code
+    path needs, including `--company`. Without it st.company_starts is empty
+    and resolve_range floors the window at the CURRENT financial year — so the
+    documented `--company "...(22-23)" --full` would ask a 2022-23 file for
+    2026 dates, mirror nothing, and log the run as Success.
     """
     try:
         infos = list_companies(st.tally)
     except TallyError:
         infos = []
-    open_now = [c["name"] for c in infos]
     # Each company file covers its own period (books here are one file per
     # financial year), so remember where each begins.
     starts = {}
@@ -215,6 +215,19 @@ def resolve_companies(st: Settings) -> list:
             except ValueError:
                 pass
     st.company_starts = starts
+    return [c["name"] for c in infos]
+
+
+def resolve_companies(st: Settings) -> list:
+    """
+    Decide which companies to sync.
+
+    An empty `companies` list means "whatever is open in Tally right now",
+    which is the friendliest default on a server where companies come and go.
+    Configured names are checked against what Tally actually has open so a
+    typo surfaces as a warning instead of silently syncing nothing.
+    """
+    open_now = learn_company_starts(st)
 
     if not st.companies:
         if not open_now:
@@ -583,7 +596,19 @@ def main() -> int:
     fc = FrappeClient(st.frappe)
     started = datetime.now()
 
-    companies = [args.company] if args.company else resolve_companies(st)
+    if args.company:
+        # Still learn the start dates: --company skips resolve_companies, and
+        # that is the only place they were recorded. See learn_company_starts.
+        open_now = learn_company_starts(st)
+        if open_now and args.company not in open_now:
+            sys.exit(
+                f"{args.company!r} is not open in Tally, so it would sync "
+                f"nothing and still report success.\n"
+                "Open in Tally: " + ", ".join(open_now)
+            )
+        companies = [args.company]
+    else:
+        companies = resolve_companies(st)
     log.info("Syncing %d compan%s: %s",
              len(companies), "y" if len(companies) == 1 else "ies", ", ".join(companies))
 
