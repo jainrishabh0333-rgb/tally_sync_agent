@@ -187,14 +187,31 @@ class FrappeClient:
 
     def get_pending_sales_orders(self, company: str = "") -> list:
         """Orders with status=Pending, oldest first. Read-only, retry-safe."""
+        # No query params: the endpoint takes none (an unexpected kwarg is a
+        # server-side error in Frappe, not an ignored extra). The company
+        # filter is applied here instead.
         out = self._call(
             "GET", "/api/method/tally_bridge.api.pending_sales_orders",
-            params={"company": company} if company else None,
         )
         msg = out.get("message", out) if isinstance(out, dict) else out
         if isinstance(msg, dict):
-            msg = msg.get("orders") or []
-        return msg if isinstance(msg, list) else []
+            stuck = msg.get("stuck_importing") or 0
+            if stuck:
+                # An Importing row over 30 minutes old means an importer died
+                # mid-send. Deliberately NOT auto-retried — Tally may or may
+                # not hold the voucher — so make sure a human hears about it.
+                log.warning("%d order(s) stuck in Importing for over 30 "
+                            "minutes — an import died mid-send. Check Tally "
+                            "for those orders before re-queueing them.", stuck)
+            # The endpoint returns the list under "rows". The first cut of
+            # this method read "orders" and silently saw an empty queue
+            # forever — reading BOTH keys keeps either side free to be fixed
+            # without re-breaking the other.
+            msg = msg.get("rows") or msg.get("orders") or []
+        rows = msg if isinstance(msg, list) else []
+        if company:
+            rows = [r for r in rows if (r.get("company") or "") == company]
+        return rows
 
     def mark_order_result(self, order_key: str, status: str,
                           error: str = "", tally_vch_no: str = "") -> dict:
