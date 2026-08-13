@@ -175,6 +175,43 @@ class FrappeClient:
         )
         return out.get("message", {}) if isinstance(out, dict) else {}
 
+    # -- sales-order queue (the ONE write path towards Tally) ---------------
+    # Approved orders sit in a queue DocType on Frappe; order_importer.py on
+    # the Tally server drains it. Both calls below ride _call's retry loop,
+    # and that is SAFE for them specifically: reading the queue changes
+    # nothing, and writing the same status twice lands in the same place.
+    # The caveat lives one layer up — the Tally IMPORT itself must never be
+    # retried blindly (a lost response may mean the voucher already exists),
+    # which is why order_importer.py sends each envelope exactly once and
+    # only records the outcome here.
+
+    def get_pending_sales_orders(self, company: str = "") -> list:
+        """Orders with status=Pending, oldest first. Read-only, retry-safe."""
+        out = self._call(
+            "GET", "/api/method/tally_bridge.api.pending_sales_orders",
+            params={"company": company} if company else None,
+        )
+        msg = out.get("message", out) if isinstance(out, dict) else out
+        if isinstance(msg, dict):
+            msg = msg.get("orders") or []
+        return msg if isinstance(msg, list) else []
+
+    def mark_order_result(self, order_key: str, status: str,
+                          error: str = "", tally_vch_no: str = "") -> dict:
+        """
+        Record an order's state transition (Importing / Imported / Failed).
+
+        Idempotent on the Frappe side (keyed by order_key), so _call's
+        transient-error retries cannot double anything. `error` carries the
+        failure text shown to the operator; `tally_vch_no` the voucher
+        number/id Tally reported on success.
+        """
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.mark_order_result",
+            json={"order_key": order_key, "status": status,
+                  "error": error, "tally_vch_no": tally_vch_no},
+        )
+
     def ping(self) -> str:
         out = self._call("GET", "/api/method/frappe.auth.get_logged_user")
         return out.get("message", "?") if isinstance(out, dict) else str(out)

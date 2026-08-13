@@ -54,3 +54,12 @@ chunk_days = 7
 overlap_days = 7
 # Financial year start month (4 = April, Indian FY).
 fy_start_month = 4
+
+[orders]
+# Settings for order_importer.py — the ONLY script that writes into Tally
+# (approved Sales Orders from the Frappe queue; quantity-only, no rates).
+# Godown name placed on every size/batch line, exactly as Tally shows it.
+godown = "Any"
+# false = one pass and exit (run it by hand or from Task Scheduler).
+# true  = keep running and drain the queue every 60 seconds.
+poll = false
