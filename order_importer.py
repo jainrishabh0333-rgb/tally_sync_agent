@@ -382,6 +382,14 @@ def build_envelope(o: dict, sales_ledger: str) -> str:
             "    <ACCOUNTINGALLOCATIONS.LIST>\n"
             f"     <LEDGERNAME>{esc(sales_ledger)}</LEDGERNAME>\n"
             "     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n"
+            "     <LEDGERFROMITEM>No</LEDGERFROMITEM>\n"
+            # The line every specimen carries and the first two imports left
+            # out: without it Tally REMOVES zero-amount allocations on
+            # import, then drops the item lines that depended on them, and
+            # the voucher arrives empty — "No accounting or inventory
+            # entries are available". For a quantity-only order this flag is
+            # the difference between importing and not existing.
+            "     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>\n"
             "     <ISPARTYLEDGER>No</ISPARTYLEDGER>\n"
             "     <AMOUNT>0</AMOUNT>\n"
             "    </ACCOUNTINGALLOCATIONS.LIST>\n"
@@ -413,6 +421,8 @@ def build_envelope(o: dict, sales_ledger: str) -> str:
         "   <LEDGERENTRIES.LIST>\n"
         f"    <LEDGERNAME>{esc(o['party'])}</LEDGERNAME>\n"
         "    <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>\n"
+        "    <LEDGERFROMITEM>No</LEDGERFROMITEM>\n"
+        "    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>\n"
         "    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>\n"
         "    <AMOUNT>0</AMOUNT>\n"
         "   </LEDGERENTRIES.LIST>\n"
@@ -536,9 +546,19 @@ def import_order(fc: FrappeClient, cfg, o: dict, xml: str) -> str:
         return "imported"
 
     # CREATED=0 with no LINEERROR is still a failure — Tally quietly ignored it.
+    # Keep the WHOLE response on disk: the first two failures were diagnosed
+    # through a 500-char window that cut off exactly at the interesting tag,
+    # and each blind retry costs the operator a full push/download/run cycle.
+    dump = HERE / "last_import_response.xml"
+    try:
+        dump.write_text(resp, encoding="utf-8")
+        where = f" (full response saved to {dump.name})"
+    except OSError:
+        where = ""
     head = " ".join(resp.split())[:300]
     _mark(fc, key, "Failed",
           error=f"Tally did not confirm the import (CREATED=0): {head}")
+    log.error("Order %s: Tally did not confirm the import%s.", key, where)
     return "failed"
 
 
