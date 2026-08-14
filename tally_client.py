@@ -1518,15 +1518,32 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
             ledger = _text(le.find("LEDGERNAME"))
             if not ledger:
                 continue
-            # ISDEEMEDPOSITIVE is Tally's own debit flag. Take direction from
-            # it and magnitude from |AMOUNT|, so the export's sign convention
-            # cannot invert anything downstream.
+            # AMOUNT arrives ALREADY SIGNED — negative is a debit, positive a
+            # credit — so negating it gives the debit-positive convention the
+            # mirror uses. Keep that sign.
+            #
+            # It used to take the magnitude from abs(AMOUNT) and the direction
+            # from ISDEEMEDPOSITIVE. That is correct for ordinary lines and
+            # silently WRONG for contra lines: a "Sale Discount" or "Rounded
+            # Off" sits on the credit side with a NEGATIVE amount, and abs()
+            # turns it into a positive credit — so the voucher misses balance
+            # by exactly twice the discount. That is the whole of the
+            # "constant 14.337% of invoice value" break once blamed on BLUE
+            # CHIP: the ratio was simply twice that party's discount rate, and
+            # it appeared for every party carrying a discount line.
+            #
+            # Measured against a full day of the live book (2026-08-14, 74
+            # vouchers): 10 failed to balance under abs(), 0 under this rule.
+            #
+            # ISDEEMEDPOSITIVE still decides is_debit, and therefore the
+            # voucher's headline `amount`, so an invoice keeps reporting its
+            # party-line value rather than the grossed-up total of every
+            # debit-side line.
             is_debit = _text(le.find("ISDEEMEDPOSITIVE")).lower() == "yes"
-            magnitude = abs(_to_float(_text(le.find("AMOUNT"))))
-            amt = magnitude if is_debit else -magnitude
+            amt = -_to_float(_text(le.find("AMOUNT")))
             v.entries.append(VoucherEntry(ledger=ledger, amount=amt, is_debit=is_debit))
             if is_debit:
-                total_debit += magnitude
+                total_debit += amt
         v.amount = round(total_debit, 2)
 
         # Belt and braces: even a range-honouring variant must never smuggle
