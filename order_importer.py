@@ -10,8 +10,12 @@ Scope, agreed with the MD and ENFORCED IN CODE — not convention:
   * Voucher type is hard-whitelisted to "Sales Order" (ALLOWED_VCHTYPE).
     The envelope is re-checked immediately before every send; anything else
     raises and nothing is sent.
-  * Quantity-only. No rates, no MRP, no amounts, no ledger entries — staff
-    price the order later in Tally.
+  * Priced from the queue's own rates. This build REFUSES zero-value
+    vouchers (proven 2026-08-13: the same clone imported with real amounts
+    and went to Import Exceptions with them zeroed), so an order carries a
+    rate per line, amounts netted through the 50+20 discount chain, and the
+    party debited with the total. No MRP, ever. Every amount is re-derived
+    from rate x qty on the outgoing bytes before the send.
   * Party and stock item names must EXACT-MATCH existing masters. Tally's
     import silently AUTO-CREATES a master on any name mismatch, so names are
     validated against the live masters BEFORE any XML is built. A mismatch
@@ -260,7 +264,16 @@ def normalise_order(raw: dict) -> dict:
                 f"line {i} ({item}): stated quantity {stated:g} does not match "
                 f"the sum of its sizes {total:g} — fix the order in the queue"
             )
-        lines.append({"item": item, "unit": unit, "qty": total, "sizes": sizes})
+        # A rate rides through untouched when present — the envelope decides
+        # priced vs not by its presence, so a dropped rate here would silently
+        # produce the zero-value shape Tally refuses.
+        rate = _to_qty(ln.get("rate"))
+        if rate is not None and rate <= 0:
+            raise OrderDataError(
+                f"line {i} ({item}): rate {ln.get('rate')!r} is not positive"
+            )
+        lines.append({"item": item, "unit": unit, "qty": total,
+                      "sizes": sizes, "rate": rate})
 
     return {
         "order_key": key,
@@ -321,23 +334,101 @@ def _assert_sales_order(xml: str) -> None:
             f"{ALLOWED_VCHTYPE!r} voucher (VCHTYPE={kinds!r}, "
             f"VOUCHERTYPENAME={names!r})."
         )
-    for banned in ("<RATE>", "<MRP", "<DISCOUNT>"):
-        if banned in xml:
-            raise RuntimeError(
-                f"SAFETY: refusing to send — envelope contains {banned!r}; "
-                "this flow is quantity-only."
-            )
+    if "<MRP" in xml:
+        raise RuntimeError(
+            "SAFETY: refusing to send — envelope contains an MRP tag; "
+            "this flow never writes MRP."
+        )
     # Ledger lines ARE present — a real order carries the party line and a
     # sales-ledger allocation, and Tally parks the voucher in Import
-    # Exceptions without them (learned from 22 exported specimens). The
-    # money guarantee moves to the amounts themselves: every AMOUNT in the
-    # envelope must be exactly zero.
-    nonzero = [a for a in re.findall(r"<AMOUNT>([^<]*)</AMOUNT>", xml)
-               if a.strip() not in ("0", "0.00")]
-    if nonzero:
+    # Exceptions without them (learned from 22 exported specimens).
+    #
+    # Two money shapes are legal, and which one applies is decided by the
+    # presence of RATE, never by intent:
+    #
+    #   quantity-only — every AMOUNT exactly zero. Kept for the record; this
+    #     build REFUSES such vouchers (CREATED=0, proven live 2026-08-13), so
+    #     it is not a shape any caller should choose.
+    #   priced — every line carries RATE and a non-zero AMOUNT, and the
+    #     party's LEDGERENTRIES AMOUNT is the negative of the inventory total
+    #     (debit exports negative). The arithmetic is re-checked below on the
+    #     outgoing bytes, so a pricing bug cannot reach the books as a
+    #     plausible-looking number.
+    amounts = [a.strip() for a in re.findall(r"<AMOUNT>([^<]*)</AMOUNT>", xml)]
+    priced = "<RATE>" in xml
+    if not priced:
+        nonzero = [a for a in amounts if a not in ("0", "0.00")]
+        if nonzero:
+            raise RuntimeError(
+                f"SAFETY: refusing to send — non-zero AMOUNT(s) {nonzero!r} "
+                "in an unpriced envelope."
+            )
+        return
+    _assert_priced_arithmetic(xml)
+
+
+# The discount chain this book sells on. Measured, not assumed: of 4,364
+# inventory lines across 204 Sales Orders exported 2026-08-01..13, 4,337
+# carry DISCOUNT 50 and an AMOUNT equal to rate x qty x 0.4 — a 50% then 20%
+# chain — and the remaining 27 carry DISCOUNT 0 at full value. Tally itself
+# writes only the FIRST step in the DISCOUNT tag and the fully-netted figure
+# in AMOUNT, so that is what is written back.
+DISCOUNT_FIRST = 50.0
+NET_FACTOR = 0.4
+_MONEY_TOL = 0.02
+
+
+def _net_amount(rate: float, qty: float) -> float:
+    return round(rate * qty * NET_FACTOR, 2)
+
+
+def _assert_priced_arithmetic(xml: str) -> None:
+    """
+    Re-derive every amount from rate x qty on the outgoing bytes.
+
+    A wrong rate is a business decision made badly; a wrong AMOUNT against a
+    right rate is a silent corruption that nobody reading the voucher would
+    catch. This catches the second kind before it is sent.
+    """
+    total = 0.0
+    for block in re.findall(
+            r"<ALLINVENTORYENTRIES\.LIST>(.*?)</ALLINVENTORYENTRIES\.LIST>",
+            xml, re.S):
+        def one(tag: str, text: str = block) -> str:
+            m = re.search(rf"<{tag}>([^<]*)</{tag}>", text)
+            return m.group(1).strip() if m else ""
+        rate = float(one("RATE").split("/")[0] or 0)
+        qty = float((one("ACTUALQTY") or "0").split()[0])
+        amount = float(one("AMOUNT") or 0)
+        if rate <= 0 or qty <= 0:
+            raise RuntimeError(
+                f"SAFETY: refusing to send — line with rate {rate!r} and "
+                f"qty {qty!r}; a priced order needs both."
+            )
+        if abs(amount - _net_amount(rate, qty)) > _MONEY_TOL:
+            raise RuntimeError(
+                f"SAFETY: refusing to send — line AMOUNT {amount} does not "
+                f"equal rate {rate} x qty {qty} x {NET_FACTOR}."
+            )
+        total += amount
+        # The batches under a line must add up to the line, or Tally would
+        # book a different quantity than the sizes say.
+        bsum = sum(float(m) for m in re.findall(
+            r"<BATCHALLOCATIONS\.LIST>(?:(?!</BATCHALLOCATIONS).)*?"
+            r"<AMOUNT>([^<]*)</AMOUNT>", block, re.S))
+        if abs(bsum - amount) > _MONEY_TOL:
+            raise RuntimeError(
+                f"SAFETY: refusing to send — batch amounts {bsum} do not sum "
+                f"to line amount {amount}."
+            )
+    party = re.search(
+        r"<LEDGERENTRIES\.LIST>.*?<AMOUNT>([^<]*)</AMOUNT>", xml, re.S)
+    if not party:
+        raise RuntimeError("SAFETY: refusing to send — no party ledger entry.")
+    if abs(float(party.group(1)) + round(total, 2)) > _MONEY_TOL:
         raise RuntimeError(
-            f"SAFETY: refusing to send — non-zero AMOUNT(s) {nonzero!r}; "
-            "this flow is quantity-only."
+            f"SAFETY: refusing to send — party ledger {party.group(1)} is not "
+            f"minus the inventory total {total:.2f} (debit exports negative)."
         )
 
 
@@ -382,34 +473,51 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
       own ORDERDUEDATE, written as d-MMM-yy exactly as the specimens show.
     - Each inventory line carries an ACCOUNTINGALLOCATIONS.LIST naming the
       sales ledger, and the voucher carries the party LEDGERENTRIES.LIST —
-      both present in every specimen. Quantity-only means their AMOUNTs are
-      zero (staff price the order in Tally), not that they are absent.
+      both present in every specimen.
+
+    A line carrying `rate` is priced: RATE/DISCOUNT on the line, BATCHRATE/
+    BATCHDISCOUNT per size, amounts netted through the discount chain, and
+    the party ledger debited with the total. A line without one keeps the
+    original zero-amount shape — which this build refuses, so it is only
+    still here for the record.
     """
     esc = _xml_escape
     d = _fmt_date(o["order_date"])
 
-    inv = []
+    inv, grand = [], 0.0
     for ln in o["lines"]:
+        rate = float(ln.get("rate") or 0)
         batches = []
         for sz in ln["sizes"]:
             due = _due_literal(o["order_date"] + timedelta(days=sz["due_days"]))
             q = _fmt_qty(sz["qty"], ln["unit"])
+            b_amt = (f"{_net_amount(rate, sz['qty']):.2f}" if rate else "0")
             batches.append(
                 "    <BATCHALLOCATIONS.LIST>\n"
                 f"     <BATCHNAME>{esc(sz['size'])}</BATCHNAME>\n"
                 f"     <ORDERNO>{esc(o['order_no'])}</ORDERNO>\n"
-                "     <AMOUNT>0</AMOUNT>\n"
+                + (f"     <BATCHRATE>{rate:.2f}/{esc(ln['unit'])}</BATCHRATE>\n"
+                   f"     <BATCHDISCOUNT>{DISCOUNT_FIRST:g}</BATCHDISCOUNT>\n"
+                   if rate else "")
+                + f"     <AMOUNT>{b_amt}</AMOUNT>\n"
                 f"     <ACTUALQTY>{q}</ACTUALQTY>\n"
                 f"     <BILLEDQTY>{q}</BILLEDQTY>\n"
                 f"     <ORDERDUEDATE>{due}</ORDERDUEDATE>\n"
                 "    </BATCHALLOCATIONS.LIST>"
             )
         lq = _fmt_qty(ln["qty"], ln["unit"])
+        # Batches are rounded individually, so the line takes their sum rather
+        # than its own rounding of the total — otherwise a half-paisa gap
+        # between the two would trip the arithmetic check.
+        line_amt = (round(sum(_net_amount(rate, sz["qty"]) for sz in ln["sizes"]), 2)
+                    if rate else 0)
         inv.append(
             "   <ALLINVENTORYENTRIES.LIST>\n"
             f"    <STOCKITEMNAME>{esc(ln['item'])}</STOCKITEMNAME>\n"
             "    <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n"
-            "    <AMOUNT>0</AMOUNT>\n"
+            + (f"    <RATE>{rate:.2f}/{esc(ln['unit'])}</RATE>\n"
+               f"    <DISCOUNT>{DISCOUNT_FIRST:g}</DISCOUNT>\n" if rate else "")
+            + f"    <AMOUNT>{line_amt:.2f}</AMOUNT>\n"
             f"    <ACTUALQTY>{lq}</ACTUALQTY>\n"
             f"    <BILLEDQTY>{lq}</BILLEDQTY>\n"
             + "\n".join(batches) + "\n"
@@ -425,10 +533,11 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
             # the difference between importing and not existing.
             "     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>\n"
             "     <ISPARTYLEDGER>No</ISPARTYLEDGER>\n"
-            "     <AMOUNT>0</AMOUNT>\n"
+            f"     <AMOUNT>{line_amt:.2f}</AMOUNT>\n"
             "    </ACCOUNTINGALLOCATIONS.LIST>\n"
             "   </ALLINVENTORYENTRIES.LIST>"
         )
+        grand += line_amt
 
     xml = (
         "<ENVELOPE>\n"
@@ -472,7 +581,7 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
            f"   <CONSIGNEESTATENAME>{esc(_state_from_gstin(party_gstin))}</CONSIGNEESTATENAME>\n"
            if _state_from_gstin(party_gstin) else "")
         + f"   <NARRATION>Queued from photographed order via Claude "
-        f"({esc(o['order_key'])}); quantities only, to be priced.</NARRATION>\n"
+        f"({esc(o['order_key'])}).</NARRATION>\n"
         + "\n".join(inv) + "\n"
         "   <LEDGERENTRIES.LIST>\n"
         f"    <LEDGERNAME>{esc(o['party'])}</LEDGERNAME>\n"
@@ -480,7 +589,9 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
         "    <LEDGERFROMITEM>No</LEDGERFROMITEM>\n"
         "    <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>\n"
         "    <ISPARTYLEDGER>Yes</ISPARTYLEDGER>\n"
-        "    <AMOUNT>0</AMOUNT>\n"
+        # Debit exports NEGATIVE in this book: the party owes the total, so
+        # the party line carries minus the inventory sum.
+        f"    <AMOUNT>{-grand:.2f}</AMOUNT>\n"
         "   </LEDGERENTRIES.LIST>\n"
         "  </VOUCHER>\n"
         "  </TALLYMESSAGE></DATA></BODY></ENVELOPE>"

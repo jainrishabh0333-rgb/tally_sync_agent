@@ -15,3 +15,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Sent orders — the exact XML sent to Tally and Tally's reply. Business data
+# (party, GSTIN, rates, amounts) and this repo is public: keep them local.
+sent_orders/
+sent-*.xml
+resp-*.xml
