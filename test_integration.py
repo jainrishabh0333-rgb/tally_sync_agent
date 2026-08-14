@@ -87,6 +87,28 @@ GROUPS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
 
 
 def _voucher(guid, num, day, party, amount):
+    """
+    One sales voucher, shaped the way the LIVE server actually exports.
+
+    Two things here were wrong and both hid a real bug:
+
+    * The signs were inverted. Real Tally exports a DEBIT as NEGATIVE and a
+      CREDIT as POSITIVE — confirmed on the live book, where the party line of
+      SNJ/26-27/2195 came back as -265,764.00 with ISDEEMEDPOSITIVE=Yes. The
+      fixture had it the other way round, so it could never catch a
+      sign-handling regression.
+    * There was no CONTRA line. A discount or round-off sits on the credit
+      side with a NEGATIVE amount, and that is precisely the case the parser
+      used to get wrong — abs() turned it into a positive credit and the
+      voucher missed balance by twice the discount. Ten of seventy-four live
+      vouchers on 2026-08-13 were broken this way. The discount line below
+      exists so that can never regress silently again.
+
+    Layout: party Dr `amount`, sales Cr 1.1 x, discount Dr 0.1 x — which
+    balances, and keeps the voucher's headline `amount` equal to the party
+    line, since only that line carries ISDEEMEDPOSITIVE=Yes.
+    """
+    a = float(amount)
     return f"""
  <VOUCHER VCHTYPE="Sales">
   <GUID>{guid}</GUID><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>
@@ -95,9 +117,11 @@ def _voucher(guid, num, day, party, amount):
   <NARRATION>Steel rods &amp; fittings</NARRATION>
   <ISCANCELLED>No</ISCANCELLED><ALTERID>90{num[-1]}</ALTERID>
   <ALLLEDGERENTRIES.LIST><LEDGERNAME>{party}</LEDGERNAME>
-   <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>{amount}</AMOUNT></ALLLEDGERENTRIES.LIST>
+   <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>{-a:.2f}</AMOUNT></ALLLEDGERENTRIES.LIST>
   <ALLLEDGERENTRIES.LIST><LEDGERNAME>Sales Account</LEDGERNAME>
-   <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>-{amount}</AMOUNT></ALLLEDGERENTRIES.LIST>
+   <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>{a * 1.1:.2f}</AMOUNT></ALLLEDGERENTRIES.LIST>
+  <ALLLEDGERENTRIES.LIST><LEDGERNAME>Sale Discount</LEDGERNAME>
+   <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>{-a * 0.1:.2f}</AMOUNT></ALLLEDGERENTRIES.LIST>
  </VOUCHER>"""
 
 
@@ -360,8 +384,15 @@ def main() -> int:
     check("iso date", v.date, "2025-04-15")
     check("party", v.party, "Acme Traders & Co")
     check("voucher total from debits", v.amount, 118000.0)
-    check("entry count", len(v.entries), 2)
+    check("entry count", len(v.entries), 3)
     check("entries net to zero", round(sum(e.amount for e in v.entries), 2), 0.0)
+    # The regression guard: the contra line is a NEGATIVE amount on the credit
+    # side, and must stay negative-in-magnitude rather than being abs()'d into
+    # a positive credit. Get this wrong and the voucher misses balance by
+    # twice the discount — which is exactly what "entries net to zero" above
+    # would then catch.
+    disc = [e for e in v.entries if e.ledger == "Sale Discount"][0]
+    check("contra line keeps its sign", round(disc.amount, 2), 11800.0)
     check("narration ampersand", v.narration, "Steel rods & fittings")
 
     print("\nagent -> frappe push")
@@ -390,7 +421,7 @@ def main() -> int:
     pv = store["vouchers"][0]
     check_true("voucher payload has guid", pv.get("guid") == "guid-0001")
     check_true("voucher payload nests entries",
-               isinstance(pv.get("entries"), list) and len(pv["entries"]) == 2)
+               isinstance(pv.get("entries"), list) and len(pv["entries"]) == 3)
     check_true("voucher payload is JSON-serialisable", json.dumps(pv) is not None)
 
     print("\nincremental resume + chunking")
