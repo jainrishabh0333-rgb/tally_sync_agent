@@ -50,7 +50,7 @@ Config: config.toml (same file as sync.py), optional [orders] section:
 Expected order shape from Frappe (tally_bridge.api.pending_sales_orders):
     {"order_key": "...", "order_no": "...", "company": "...", "party": "...",
      "order_date": "2026-08-13", "items": [
-        {"item": "STYLE 1234", "unit": "Doz", "sizes": [
+        {"item": "STYLE 1234", "unit": "Doz", "rate": 2400, "sizes": [
             {"size": "28", "qty": 2.5, "due_days": 7}, ...]}, ...]}
 """
 
@@ -213,7 +213,16 @@ def normalise_order(raw: dict) -> dict:
                 raise OrderDataError(f"line {i} has no stock item name")
             g = grouped.setdefault(item, {"item": item,
                                           "unit": str(ln.get("unit") or "Doz"),
+                                          "rate": ln.get("rate"),
                                           "sizes": []})
+            # The rate belongs to the item line, but the queue stores one row
+            # per size — so every row for an item must agree, or the price
+            # that reached Tally would depend on row order.
+            if _to_qty(ln.get("rate")) != _to_qty(g.get("rate")):
+                raise OrderDataError(
+                    f"line {i} ({item}): rows disagree on rate "
+                    f"({g.get('rate')!r} vs {ln.get('rate')!r})"
+                )
             g["sizes"].append({
                 "size": str(ln.get("size_batch") or "").strip(),
                 "qty": ln.get("qty"),
@@ -462,7 +471,7 @@ def _due_literal(d: "date") -> str:
 def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
                    optional: bool = False) -> str:
     """
-    Import envelope for ONE sales order — quantity-only, shaped to match how
+    Import envelope for ONE sales order, shaped to match how
     THIS Tally serialises operator-entered orders (22 live specimens,
     exported 2026-08-13, sample_orders.xml):
 
@@ -529,8 +538,8 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
             # out: without it Tally REMOVES zero-amount allocations on
             # import, then drops the item lines that depended on them, and
             # the voucher arrives empty — "No accounting or inventory
-            # entries are available". For a quantity-only order this flag is
-            # the difference between importing and not existing.
+            # entries are available". Kept on priced lines too — the flag
+            # costs nothing and the failure it prevents is silent.
             "     <REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>\n"
             "     <ISPARTYLEDGER>No</ISPARTYLEDGER>\n"
             f"     <AMOUNT>{line_amt:.2f}</AMOUNT>\n"
