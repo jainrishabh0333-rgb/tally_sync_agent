@@ -232,10 +232,47 @@ class FrappeClient:
         failure text shown to the operator; `tally_vch_no` the voucher
         number/id Tally reported on success.
         """
+        # The endpoint's parameter is `tally_vch_number`. This used to send
+        # `tally_vch_no`, which Frappe's argument filtering silently DROPS —
+        # every import was recorded without its Tally voucher number, and
+        # nothing errored to say so.
         return self._call(
             "POST", "/api/method/tally_bridge.api.mark_order_result",
             json={"order_key": order_key, "status": status,
-                  "error": error, "tally_vch_no": tally_vch_no},
+                  "error": error, "tally_vch_number": tally_vch_no},
+        )
+
+    # -- distributor mirror -------------------------------------------------
+
+    def upsert_sales_orders(self, orders: list[dict[str, Any]]) -> dict:
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_sales_orders",
+            json={"orders": orders},
+        )
+
+    def upsert_invoices(self, invoices: list[dict[str, Any]]) -> dict:
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_invoices",
+            json={"invoices": invoices},
+        )
+
+    def upsert_delivery_notes(self, notes: list[dict[str, Any]]) -> dict:
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_delivery_notes",
+            json={"notes": notes},
+        )
+
+    def upsert_receipts(self, receipts: list[dict[str, Any]]) -> dict:
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_receipts",
+            json={"receipts": receipts},
+        )
+
+    def upsert_stock_batches(self, batches: list[dict[str, Any]],
+                             company: str) -> dict:
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_stock_batches",
+            json={"batches": batches, "company": company},
         )
 
     def ping(self) -> str:

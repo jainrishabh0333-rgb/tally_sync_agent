@@ -60,6 +60,12 @@ fy_start_month = 4
 # (approved Sales Orders from the Frappe queue; priced from the queue's rates).
 # Godown name placed on every size/batch line, exactly as Tally shows it.
 godown = "Any"
+# Voucher types mirrored as delivery notes for the distributor portal.
+# Leave EMPTY for this book: it issues no delivery notes (goods go out as
+# Sales invoices), and listing a type that does not exist costs a wasted
+# request per cycle. Example, should the book ever add one:
+# delivery_types = ["Delivery Note"]
+delivery_types = []
 # false = one pass and exit (run it by hand or from Task Scheduler).
 # true  = keep running and drain the queue every 60 seconds.
 poll = false

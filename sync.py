@@ -28,10 +28,12 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import distributor_fetch
 from frappe_client import FrappeClient, FrappeConfig, FrappeError
 from tally_client import (
     TallyConfig,
     TallyError,
+    _parse_credit_days,
     _tally_date_to_iso,
     fetch_bills,
     fetch_godowns,
@@ -73,6 +75,11 @@ class Settings:
     overlap_days: int = 7         # re-pull recent days to catch back-dated edits
     fy_start_month: int = 4       # Indian financial year starts April
     company_starts: dict = dataclasses.field(default_factory=dict)
+    # Voucher type names treated as delivery notes. Empty by default is
+    # CORRECT for this book: it has no such voucher type (measured
+    # 2026-08-15) — goods reach a distributor as a Sales invoice. Set
+    # [orders].delivery_types in config.toml if that ever changes.
+    delivery_types: list = dataclasses.field(default_factory=list)
 
 
 def _read_toml(cfg_path: Path) -> dict:
@@ -179,6 +186,11 @@ def load_settings(path: Path | None = None) -> Settings:
     if not host.startswith(("http://", "https://")):
         sys.exit(f"frappe.url must start with https:// — got {frappe.url!r}")
 
+    o = data.get("orders", {})
+    delivery_types = o.get("delivery_types") or []
+    if isinstance(delivery_types, str):
+        delivery_types = [delivery_types]
+
     return Settings(
         tally=tally,
         frappe=frappe,
@@ -186,6 +198,7 @@ def load_settings(path: Path | None = None) -> Settings:
         chunk_days=int(s.get("chunk_days", 7)),
         overlap_days=int(s.get("overlap_days", 7)),
         fy_start_month=int(s.get("fy_start_month", 4)),
+        delivery_types=[str(t) for t in delivery_types],
     )
 
 
@@ -469,6 +482,17 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
         l.group_path = " > ".join(reversed(chain)) if chain else l.parent
         l.primary_group = classify_group(chain) if chain else l.parent
 
+    # Distributor-facing fields: credit limit/period, address, mobile, price
+    # level. One extra request per company; merged into the same payload so
+    # there is exactly one ledger pipeline, not two that can disagree.
+    try:
+        extras = distributor_fetch.fetch_ledger_extras(
+            st.tally, date.today(),
+            st.company_starts.get(st.tally.company) or date.today())
+    except TallyError as exc:
+        log.warning("Ledger distributor fields skipped for this run: %s", exc)
+        extras = {}
+
     resolved = sum(1 for l in ledgers if l.primary_group != l.parent)
     log.info("Resolved %d/%d ledgers to a reserved group above their own",
              resolved, len(ledgers))
@@ -480,6 +504,22 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
                      grp, n, direct, n - direct)
 
     payload = [dataclasses.asdict(l) for l in ledgers]
+    for row in payload:
+        row.update(extras.get(row["name"], {}))
+        # The agent (salesperson) is the immediate group under Sundry
+        # Debtors in this book — "AGENT RK" and the like. No ledger UDF
+        # carries it (inspected 2026-08-15: the export shows no UDF tags on
+        # ledgers), so the group IS the answer; agent_source records that so
+        # nothing downstream re-derives it.
+        if (row.get("primary_group") == "Sundry Debtors"
+                and row.get("parent")
+                and row["parent"] != "Sundry Debtors"):
+            row["agent"] = row["parent"]
+            row["agent_source"] = "group"
+        else:
+            row["agent"] = ""
+            row["agent_source"] = ""
+        row["credit_days"] = _parse_credit_days(row.get("credit_period") or "")
     # Push in batches so a huge chart of accounts doesn't blow the request size.
     pushed = 0
     rejected = 0
@@ -524,6 +564,74 @@ def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date) -> int:
         log.info("  %s..%s: %d vouchers%s", c_from, c_to, len(payload) - rejected,
                  f" ({rejected} rejected)" if rejected else "")
     return total
+
+
+def sync_distributor_docs(st: Settings, fc: FrappeClient,
+                          frm: date, to: date) -> dict:
+    """
+    Mirror the distributor-facing documents for [frm, to]: sales orders,
+    invoices, receipts, delivery notes (if the book has any), and the
+    per-size stock balances harvested from those same payloads.
+
+    Rides the voucher date window, so incremental runs stay incremental.
+    Each document family is chunked like vouchers — this book's fortnight of
+    Sales Orders alone is a 27 MB export.
+    """
+    counts = {"sales_orders": 0, "invoices": 0, "receipts": 0,
+              "delivery_notes": 0, "size_balances": 0}
+    harvest: list = []
+
+    for c_from, c_to in date_chunks(frm, to, st.chunk_days):
+        orders = distributor_fetch.fetch_sales_orders(st.tally, c_from, c_to)
+        if orders:
+            res = fc.upsert_sales_orders(orders) or {}
+            msg = res.get("message", res) if isinstance(res, dict) else {}
+            _report_rejects(msg, "sales order")
+            counts["sales_orders"] += len(orders)
+            harvest.extend(orders)
+
+        invoices = distributor_fetch.fetch_invoices(st.tally, c_from, c_to)
+        if invoices:
+            res = fc.upsert_invoices(invoices) or {}
+            msg = res.get("message", res) if isinstance(res, dict) else {}
+            _report_rejects(msg, "invoice")
+            counts["invoices"] += len(invoices)
+            harvest.extend(invoices)
+
+        receipts = distributor_fetch.fetch_receipts(st.tally, c_from, c_to)
+        if receipts:
+            res = fc.upsert_receipts(receipts) or {}
+            msg = res.get("message", res) if isinstance(res, dict) else {}
+            _report_rejects(msg, "receipt")
+            counts["receipts"] += len(receipts)
+
+        if st.delivery_types:
+            notes = distributor_fetch.fetch_delivery_notes(
+                st.tally, c_from, c_to, st.delivery_types)
+            if notes:
+                res = fc.upsert_delivery_notes(notes) or {}
+                msg = res.get("message", res) if isinstance(res, dict) else {}
+                _report_rejects(msg, "delivery note")
+                counts["delivery_notes"] += len(notes)
+
+    # Per-size stock, read out of the order-pad's own BlncQty UDF on the
+    # vouchers just fetched. Zero extra Tally traffic; each figure carries
+    # the voucher date it was true on.
+    balances = distributor_fetch.harvest_size_balances(harvest)
+    if balances:
+        for b in balances:
+            b["company"] = st.tally.company
+        res = fc.upsert_stock_batches(balances, st.tally.company) or {}
+        msg = res.get("message", res) if isinstance(res, dict) else {}
+        _report_rejects(msg, "size balance")
+        counts["size_balances"] = len(balances)
+
+    log.info("Distributor docs %s..%s: %d orders, %d invoices, %d receipts, "
+             "%d delivery notes, %d size balances",
+             frm, to, counts["sales_orders"], counts["invoices"],
+             counts["receipts"], counts["delivery_notes"],
+             counts["size_balances"])
+    return counts
 
 
 def resolve_range(st: Settings, fc: FrappeClient, args, company: str = "") -> tuple[date, date]:
@@ -648,6 +756,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the outstanding-bills snapshot")
     p.add_argument("--no-inventory", action="store_true",
                    help="skip inventory masters")
+    p.add_argument("--no-distributor", action="store_true",
+                   help="skip the distributor mirror (orders, invoices, "
+                        "receipts, size balances)")
     p.add_argument("--company", metavar="NAME", default=None,
                    help="sync only this company, ignoring config.toml. "
                         "The name must match Tally exactly.")
@@ -738,6 +849,8 @@ def main() -> int:
                 frm, to = resolve_range(st, fc, args, company)
                 counts["vouchers"] = sync_vouchers(st, fc, frm, to)
                 counts["range"] = f"{frm}..{to}"
+                if not args.no_distributor:
+                    counts["distributor"] = sync_distributor_docs(st, fc, frm, to)
         except (TallyError, FrappeError, ValueError) as exc:
             # One bad company must not abort the rest.
             log.error("Sync failed for %s: %s", company, exc)
