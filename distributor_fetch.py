@@ -118,9 +118,11 @@ _MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
 
-# Tally's JD attribute is an Excel-style serial. Anchored on a live pair
-# (JD='46234', P='1-Aug-26'): 1899-12-30 + 46234 days = 2026-08-01. Tested.
-_JD_EPOCH = date(1899, 12, 30)
+# Tally's JD attribute is a day serial with 1-Jan-1900 as day 1. Anchored on
+# a live pair (JD='46234' printed beside '1-Aug-26'): 1899-12-31 + 46234
+# days = 2026-08-01. One off from Excel's epoch, which is why this is pinned
+# by a test rather than assumed.
+_JD_EPOCH = date(1899, 12, 31)
 
 
 def parse_due_date(el, voucher_date: str) -> str:
