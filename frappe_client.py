@@ -137,11 +137,20 @@ class FrappeClient:
             json={"vouchers": vouchers},
         )
 
-    def upsert_bills(self, bills: list[dict[str, Any]], company: str) -> dict:
+    def upsert_bills(self, bills: list[dict[str, Any]], company: str,
+                     replace: int = 1) -> dict:
+        """
+        Send one batch of bills.
+
+        `replace` clears the company's existing snapshot first and must be set
+        on the FIRST batch only — passing it on every batch would leave just
+        the last batch standing.
+        """
         return self._call(
             "POST",
             "/api/method/tally_bridge.api.upsert_bills",
-            json={"bills": bills, "company": company, "replace": 1},
+            json={"bills": bills, "company": company,
+                  "replace": 1 if replace else 0},
         )
 
     def upsert_inventory(self, company: str, **payload) -> dict:
