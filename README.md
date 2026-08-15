@@ -36,7 +36,7 @@ On the Tally server, open GitHub in a browser, click the green **Code**
 button → **Download ZIP**. Extract to a simple path such as:
 
 ```
-C:\tally-bridge\
+C:\tally_bridge\
 ```
 
 ### 3. Install the dependencies
@@ -44,7 +44,7 @@ C:\tally-bridge\
 Open **Command Prompt**, then:
 
 ```
-cd C:\tally-bridge
+cd C:\tally_bridge
 pip install -r requirements.txt
 ```
 

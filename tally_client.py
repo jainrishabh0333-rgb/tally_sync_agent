@@ -575,6 +575,10 @@ class Ledger:
 # Bill-wise fields, most valuable first. Tally answers an unrecognised
 # NATIVEMETHOD with a LINEERROR that kills the whole request, so the optional
 # ones are dropped progressively rather than assumed.
+# Far enough back that no live book predates it. Pending bills are a snapshot
+# as on a date, so the collection must not be scoped to the current year.
+_BILLS_EPOCH = date(1980, 4, 1)
+
 _BILL_CORE = ["Name", "Parent", "BillDate", "ClosingBalance"]
 _BILL_EXTRA = ["BillCreditPeriod", "OpeningBalance", "IsAdvance", "BillFixed", "BaseClosing"]
 
@@ -828,10 +832,24 @@ def fetch_stock_items(cfg: TallyConfig, as_on: "date | None" = None,
             additional_units=_text(el.find("ADDITIONALUNITS")),
             conversion=_to_float(_text(el.find("CONVERSION"))),
             opening_qty=oq, opening_qty_raw=oraw,
-            opening_value=_to_float(_text(el.find("OPENINGVALUE"))),
+            # Stock VALUE exports on the credit side, the same convention as
+            # ledger amounts: goods you are holding come back NEGATIVE. The
+            # quantity does not — it is already positive for stock on hand.
+            #
+            # MEASURED against the live book 2026-08-15 across all 2,900
+            # items: 1,322 have qty POSITIVE with value NEGATIVE, 46 have the
+            # exact inverse (genuinely negative stock), 1,521 are flat. The
+            # value sign consistently OPPOSES the quantity sign, i.e.
+            # value = -(qty x rate), so one negation fixes every row and
+            # keeps negative stock reading negative.
+            #
+            # Left unnegated, `stock_summary` reported the entire inventory as
+            # a negative number and `search_items` sorted stocked goods LAST —
+            # a style with 249 boxes on hand answered as "0.00".
+            opening_value=-_to_float(_text(el.find("OPENINGVALUE"))),
             closing_qty=cq, closing_qty_raw=craw, closing_qty_unit=cu,
             closing_rate=rate, closing_rate_unit=runit,
-            closing_value=_to_float(_text(el.find("CLOSINGVALUE"))),
+            closing_value=-_to_float(_text(el.find("CLOSINGVALUE"))),
             costing_method=_text(el.find("COSTINGMETHOD")),
             is_batchwise=_text(el.find("ISBATCHWISEON")).lower() == "yes",
             hsn_code=_text(el.find("INFGSTHSNCODE")),
@@ -891,9 +909,17 @@ def fetch_bills(cfg: TallyConfig, as_on: date) -> list:
     period — so the due date and overdue days are derived. Optional fields are
     dropped one at a time if this build rejects them, so a single unsupported
     method cannot cost the whole request.
+
+    Pending bills are a snapshot AS ON a date, never a range. Scoping the
+    request from the company's own start date (1-Apr for the current year)
+    silently dropped every bill raised before it — and on a carried-forward
+    book that is nearly all of them. One party showed 156 pending bills in
+    Tally, dated from the previous October onward, while this function
+    returned 51 for the entire company. So the window opens at _BILLS_EPOCH
+    and only the as-on date is meaningful.
     """
     assert_company_loaded(cfg)
-    start = _company_start(cfg) or date(as_on.year, 4, 1)
+    start = _BILLS_EPOCH
 
     methods = _BILL_CORE + _BILL_EXTRA
     raw = None
@@ -914,7 +940,15 @@ def fetch_bills(cfg: TallyConfig, as_on: date) -> list:
 
     root = _parse_xml(raw)
     bills: list = []
-    for el in root.iter("BILLS"):
+    # Tally names these elements <BILL>, SINGULAR. Iterating "BILLS" matched
+    # nothing and returned an empty list on a request that was working
+    # perfectly — 4,637 bills came back over the wire, every field populated,
+    # and the parser walked straight past all of them. `Fetched 0 outstanding
+    # bills` therefore never meant "no bills": it meant "wrong tag name", and
+    # it read as a Tally/config problem for weeks. Verified against the live
+    # server 2026-08-15: <BILL NAME="SNJ/22-23/2087"> with NAME, PARENT,
+    # BILLDATE, BILLCREDITPERIOD, OPENINGBALANCE and CLOSINGBALANCE children.
+    for el in root.iter("BILL"):
         name = el.get("NAME") or _text(el.find("NAME"))
         party = _text(el.find("PARENT"))
         if not name or not party:
@@ -942,11 +976,21 @@ def fetch_bills(cfg: TallyConfig, as_on: date) -> list:
             closing=_to_debit_positive(_text(el.find("CLOSINGBALANCE"))),
             is_advance=_text(el.find("ISADVANCE")).lower() == "yes",
         ))
-    log.info("Fetched %d outstanding bills for %s", len(bills), cfg.company)
+    log.info("Fetched %d outstanding bills across %d parties for %s",
+             len(bills), len({b.party for b in bills}), cfg.company)
     return bills
 
 
-def _ledgers_request(cfg: TallyConfig) -> str:
+def _ledgers_request(cfg: TallyConfig, as_on: date) -> str:
+    """
+    Every ledger master with balances, valued AS ON a date.
+
+    ClosingBalance is period-sensitive: with no SVTODATE, Tally answers from
+    whatever period the loaded company happens to be showing, which need not
+    be today. That understated closing balances while OpeningBalance — which
+    is period-independent — stayed correct, so a party's own arithmetic
+    (opening + movement) disagreed with its mirrored closing balance.
+    """
     return f"""<ENVELOPE>
  <HEADER>
   <VERSION>1</VERSION>
@@ -958,6 +1002,8 @@ def _ledgers_request(cfg: TallyConfig) -> str:
   <DESC>
    <STATICVARIABLES>
     <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+    <SVFROMDATE TYPE="Date">{_fmt_date(_company_start(cfg) or _BILLS_EPOCH)}</SVFROMDATE>
+    <SVTODATE TYPE="Date">{_fmt_date(as_on)}</SVTODATE>
     {_company_tag(cfg)}
    </STATICVARIABLES>
    <TDL><TDLMESSAGE>
@@ -1132,10 +1178,10 @@ def resolve_group_chain(group_name: str, by_name: dict) -> list[str]:
     return chain
 
 
-def fetch_ledgers(cfg: TallyConfig) -> list[Ledger]:
-    """Export every ledger master with balances and party details."""
+def fetch_ledgers(cfg: TallyConfig, as_on: date | None = None) -> list[Ledger]:
+    """Export every ledger master with balances and party details, as on a date."""
     assert_company_loaded(cfg)
-    raw = _post(cfg, _ledgers_request(cfg))
+    raw = _post(cfg, _ledgers_request(cfg, as_on or date.today()))
     root = _parse_xml(raw)
     ledgers: list[Ledger] = []
     for el in root.iter("LEDGER"):
@@ -1193,6 +1239,13 @@ class Voucher:
     narration: str = ""
     amount: float = 0.0              # absolute voucher value
     is_cancelled: bool = False
+    # Tally's "optional" flag — a voucher entered but not posted, i.e. a
+    # draft. It carries a party and an amount and looks exactly like a real
+    # entry in every export, so it must be excluded from accounting reads
+    # alongside cancelled ones.
+    is_optional: bool = False
+    reference: str = ""              # the party's own order/invoice reference
+    reference_date: str = ""         # ISO
     alter_id: str = ""
     entries: list[VoucherEntry] = field(default_factory=list)
 
@@ -1209,6 +1262,29 @@ _FIELDS_RICH = ("Guid,Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate
                 "Narration,PartyLedgerName,IsInvoice,IsCancelled,AlterID,"
                 "AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,"
                 "AllLedgerEntries.IsDeemedPositive")
+
+# The proven set PLUS the six fields this server actually accepts.
+#
+# MEASURED 2026-08-15 against the live TallyPrime Edit Log 7.0, sending the
+# exact request the sync sends over a 3-day window (2026-08-10..12). Baseline
+# returned 365 vouchers; each of IsCancelled, IsOptional, AlterID, Narration,
+# Reference and ReferenceDate returned the SAME 365 with its tag populated on
+# 364 of them; and all six together returned 365 with every tag present. So on
+# this build they are free.
+#
+# The older "Edit Log 7.0 rejects these" finding came from _FIELDS_RICH, which
+# differs by also carrying IsInvoice AND by shipping different filter names.
+# IsInvoice alone is silently IGNORED here — the response was byte-identical
+# to baseline with no ISINVOICE tag — so it is deliberately left out rather
+# than risked.
+#
+# This is offered as an UPGRADE, never a replacement: it is reached through the
+# `filter_dotted_rich` variant, which _pick_voucher_variant verifies against
+# two real windows before use. If a future build chokes on any of these, the
+# agent falls back to _FIELDS_PROVEN instead of dropping into the
+# whole-company fetch that once cost a 900-second timeout.
+_FIELDS_PROVEN_PLUS = (_FIELDS_PROVEN + ",IsCancelled,IsOptional,AlterID,"
+                       "Narration,Reference,ReferenceDate")
 
 
 def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str:
@@ -1277,7 +1353,12 @@ def _voucher_request(cfg: TallyConfig, frm: date, to: date, variant: str) -> str
         # narrow set that study.py proved is tried FIRST, and the richer one
         # only as an upgrade on builds that accept it.
         plain = variant.startswith(("filter_plain", "filter_dotted"))
-        fields = _FIELDS_PROVEN if variant.startswith("filter_dotted") else _FIELDS_RICH
+        if variant.startswith("filter_dotted_rich"):
+            fields = _FIELDS_PROVEN_PLUS
+        elif variant.startswith("filter_dotted"):
+            fields = _FIELDS_PROVEN
+        else:
+            fields = _FIELDS_RICH
         names = ("TBFltrPeriod" if plain
                  else "TBFltrPeriod,TBFltrNotCancelled,TBFltrNotOptional")
         hygiene = ("" if plain else
@@ -1328,7 +1409,11 @@ _all_cache: dict = {}
 # Ordered best-first: proven before plausible, precise before broad and heavy.
 # filter_dotted is the shape study.py verified against the live server on
 # 2026-08-12 — 4,595 vouchers for April 2026, every one inside the window.
-_VARIANTS = ("filter_dotted", "filter_dotted_dmy",
+# Ordered best-first. The _rich pair leads because it carries the hygiene and
+# edit-detection fields; if a build rejects them the probe drops silently to
+# the narrow pair, which is the shape study.py originally proved.
+_VARIANTS = ("filter_dotted_rich", "filter_dotted_rich_dmy",
+             "filter_dotted", "filter_dotted_dmy",
              "filter_plain", "filter_plain_dmy", "filter",
              "daybook", "daybook_typed", "register")
 
@@ -1511,6 +1596,9 @@ def fetch_vouchers(cfg: TallyConfig, frm: date, to: date) -> list[Voucher]:
             party=_text(vel.find("PARTYLEDGERNAME")),
             narration=_text(vel.find("NARRATION")),
             is_cancelled=_text(vel.find("ISCANCELLED")).lower() == "yes",
+            is_optional=_text(vel.find("ISOPTIONAL")).lower() == "yes",
+            reference=_text(vel.find("REFERENCE")),
+            reference_date=_tally_date_to_iso(_text(vel.find("REFERENCEDATE"))),
             alter_id=_text(vel.find("ALTERID")),
         )
         total_debit = 0.0

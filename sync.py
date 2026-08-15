@@ -344,6 +344,18 @@ def sync_inventory(st: Settings, fc: FrappeClient) -> int:
     return len(items)
 
 
+# Signature of the last company's bill fetch, to catch a request that ignores
+# the company scope. TallyPrime's Bills collection has been seen answering
+# from the loaded company regardless of SVCURRENTCOMPANY: two different
+# company files returned an identical 51 bills / 41 overdue, seconds apart.
+_last_bill_fetch: tuple = ()
+
+# Bills go to Frappe in batches, like vouchers. The live book holds ~4,600 open
+# bills; one POST of that size is several megabytes inside a single database
+# transaction. 500 keeps each request small without making the run chatty.
+_BILL_BATCH = 500
+
+
 def sync_bills(st: Settings, fc: FrappeClient) -> int:
     """
     Mirror outstanding bills for the current company.
@@ -352,6 +364,7 @@ def sync_bills(st: Settings, fc: FrappeClient) -> int:
     Frappe side clears the company's previous rows before inserting, or paid
     invoices would linger and overstate what is owed.
     """
+    global _last_bill_fetch
     log.info("Syncing outstanding bills...")
     try:
         bills = fetch_bills(st.tally, date.today())
@@ -364,15 +377,54 @@ def sync_bills(st: Settings, fc: FrappeClient) -> int:
         log.info("  no outstanding bills reported.")
         return 0
 
+    # Two company files cannot legitimately hold the same bills for the same
+    # parties. If they do, the export is not honouring the company scope and
+    # the rows would be filed under the wrong company — worse than no rows.
+    signature = (len(bills), round(sum(b.closing for b in bills), 2),
+                 frozenset(b.party for b in bills))
+    if signature == _last_bill_fetch:
+        log.error(
+            "  REFUSING to write: %s returned bills identical to the previous "
+            "company (%d bills, same parties). Tally is answering from the "
+            "loaded company, not the requested one. Sync each company file in "
+            "its own run, or with only that company open.",
+            st.tally.company, len(bills),
+        )
+        return 0
+    _last_bill_fetch = signature
+
     payload = [dataclasses.asdict(b) for b in bills]
-    res = fc.upsert_bills(payload, st.tally.company) or {}
-    msg = res.get("message", res) if isinstance(res, dict) else {}
-    rejected = _report_rejects(msg, "bill")
+
+    # Chunked like vouchers. This path only started returning rows on
+    # 2026-08-15 — the parser had been iterating the wrong tag name, so every
+    # run posted an empty list and the write side was never once exercised at
+    # size. The live book yields ~4,600 open bills, and putting them through
+    # one request means a multi-megabyte POST and a single long transaction on
+    # Frappe Cloud.
+    #
+    # `replace` clears the company's snapshot and therefore belongs to the
+    # FIRST batch alone; sent every time, each batch would wipe the one before
+    # it and only the tail would survive.
+    created = rejected = 0
+    for i in range(0, len(payload), _BILL_BATCH):
+        res = fc.upsert_bills(payload[i:i + _BILL_BATCH], st.tally.company,
+                              replace=1 if i == 0 else 0) or {}
+        msg = res.get("message", res) if isinstance(res, dict) else {}
+        rejected += _report_rejects(msg, "bill")
+        if isinstance(msg, dict):
+            created += int(msg.get("created") or 0)
+    # `created` is summed from what Frappe actually stored across the batches,
+    # not from what was sent: it is the only figure that proves a row exists,
+    # and len(payload) says nothing.
     overdue = sum(1 for b in bills if b.overdue_days > 0)
-    log.info("  %d bills (%d overdue), %s",
-             len(payload) - rejected, overdue,
+    log.info("  %d of %d bills stored (%d overdue), %s",
+             created, len(payload), overdue,
              f"{rejected} rejected" if rejected else "none rejected")
-    return len(payload) - rejected
+    if created < len(payload) - rejected:
+        log.error("  %d bills went missing without an error — check the "
+                  "Frappe log for a rolled-back transaction.",
+                  len(payload) - rejected - created)
+    return created
 
 
 def _report_rejects(msg, kind: str) -> int:
@@ -391,7 +443,7 @@ def _report_rejects(msg, kind: str) -> int:
         return 0
     log.warning("%d %s(s) rejected by Frappe:", len(errs), kind)
     for e in errs[:10]:
-        label = e.get("ledger") or e.get("voucher") or "?"
+        label = e.get("ledger") or e.get("voucher") or e.get("bill") or "?"
         log.warning("    %-45s %s", label[:45], e.get("error", "")[:120])
     if len(errs) > 10:
         log.warning("    ... and %d more", len(errs) - 10)
