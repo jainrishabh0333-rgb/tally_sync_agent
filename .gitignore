@@ -24,3 +24,4 @@ resp-*.xml
 
 # Rate master — current trade rates for every item; business data, keep local
 rates_master.json
+masters_cache.json
