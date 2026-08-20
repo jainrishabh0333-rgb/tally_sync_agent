@@ -65,6 +65,16 @@ _INVENTORY = _BASE + (
     ",AllInventoryEntries.BatchAllocations.OrderNo"
 )
 
+# Invoice upgrade: Tally's dispatch details (transporter, LR number,
+# destination). UNPROVEN on this build — Tally was unreachable when added
+# (2026-08-17) — so fetch_invoices treats it exactly like the receipt bank
+# fields: try rich, and if it answers zero rows where the proven set answers
+# rows, use the proven result and log the downgrade. Nothing breaks either
+# way; the field simply stays empty until the build proves it.
+_INVENTORY_SHIP = _INVENTORY + (
+    ",BasicShippedBy,BasicShipDocumentNo,BasicFinalDestination"
+)
+
 # Receipts with bill-wise allocations. Probed the same day: 26 receipts,
 # BILLALLOCATIONS carrying NAME / BILLTYPE / AMOUNT.
 _RECEIPT = _BASE + (
@@ -369,14 +379,10 @@ def fetch_sales_orders(cfg: TallyConfig, frm: date, to: date) -> list[dict]:
     return out
 
 
-def fetch_invoices(cfg: TallyConfig, frm: date, to: date,
-                   vtypes: list[str] | None = None) -> list[dict]:
-    """Sales invoices with lines, GST breakup and bill refs."""
-    assert_company_loaded(cfg)
-    raw = _post(cfg, _voucher_body(cfg, frm, to, vtypes or ["Sales"], _INVENTORY))
+def _invoice_payloads(raw: str, company: str) -> list[dict]:
     out = []
     for vel in _parse_xml(raw).iter("VOUCHER"):
-        h = _header(vel, cfg.company)
+        h = _header(vel, company)
         if not h["guid"]:
             continue
         h["invoice_no"] = h.pop("voucher_number")
@@ -386,8 +392,44 @@ def fetch_invoices(cfg: TallyConfig, frm: date, to: date,
         h["taxable_value"] = round(
             h["amount"] - taxes["cgst"] - taxes["sgst"] - taxes["igst"]
             - taxes["cess"] - taxes["round_off"], 2)
+        h["dispatched_through"] = _text(vel.find("BASICSHIPPEDBY"))
+        h["lr_no"] = _text(vel.find("BASICSHIPDOCUMENTNO"))
+        h["destination"] = _text(vel.find("BASICFINALDESTINATION"))
         h["lines"] = _inventory_lines(vel, h["date"])
         out.append(h)
+    return out
+
+
+def fetch_invoices(cfg: TallyConfig, frm: date, to: date,
+                   vtypes: list[str] | None = None) -> list[dict]:
+    """
+    Sales invoices with lines, GST breakup, bill refs — and dispatch details
+    (transporter / LR no) where this build exports them. The dispatch fields
+    are an unproven upgrade tried first and judged against the proven set,
+    because one unknown FETCH field silently blanks the whole answer.
+    """
+    assert_company_loaded(cfg)
+    types = vtypes or ["Sales"]
+
+    rich = None
+    try:
+        raw = _post(cfg, _voucher_body(cfg, frm, to, types, _INVENTORY_SHIP))
+        rich = _invoice_payloads(raw, cfg.company)
+    except TallyError as exc:
+        log.info("Invoice fetch with dispatch fields failed (%s) — using the "
+                 "proven field set.", exc)
+
+    if rich:
+        log.info("Fetched %d invoices (with dispatch details) for %s..%s",
+                 len(rich), frm, to)
+        return rich
+
+    raw = _post(cfg, _voucher_body(cfg, frm, to, types, _INVENTORY))
+    out = _invoice_payloads(raw, cfg.company)
+    if rich is not None and out:
+        log.info("Dispatch fields blank this build's invoice export (0 rows "
+                 "vs %d proven) — transporter/LR stay empty until the office "
+                 "uploads copies.", len(out))
     log.info("Fetched %d invoices for %s..%s", len(out), frm, to)
     return out
 
