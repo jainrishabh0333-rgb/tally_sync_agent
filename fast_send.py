@@ -130,7 +130,8 @@ def main() -> int:
     if a.no_verify:
         return 0
     t0 = time.time()
-    day = date.fromisoformat(order["order_date"])
+    od = order["order_date"]
+    day = od if isinstance(od, date) else date.fromisoformat(str(od))
     mine = [v for v in fetch_sales_orders(cfg, day, day)
             if v["voucher_number"] == order["order_no"]]
     if not mine:
