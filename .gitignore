@@ -21,3 +21,6 @@ Thumbs.db
 sent_orders/
 sent-*.xml
 resp-*.xml
+
+# Rate master — current trade rates for every item; business data, keep local
+rates_master.json
