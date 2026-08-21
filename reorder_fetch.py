@@ -148,21 +148,27 @@ STOCK_VOUCHER_TYPES = [
 # Godown -> report column
 # ---------------------------------------------------------------------------
 #
-# The report's three stock columns are godown buckets. These names are the
-# real godowns in the book (enumerated live 2026-08-21). The assignment of
-# each godown to a column is INFERRED from its name and is the one part of
-# this module not yet checked against the report's own totals — validate with
-# validate_against_report() once a Reorder Report export is available.
+# The report's three stock columns are godown buckets, and this book already
+# models the shop floor as a godown TREE, so classification follows Tally's
+# own hierarchy rather than reading names. Measured live 2026-08-21:
 #
-# OPEN QUESTION, and the likeliest source of a wrong column: a day's movements
-# put 174 rows in BUCKET_OTHER, all of them PARTY godowns — stock sitting with
-# outside job workers (DHOOM CREATIONS, A.K Enterprises, Anwar Malik, Pooja,
-# Bra Mold, Rishabh Creation, RK ROSHNI HOSIERY, JMD Hosiery MGF CO, and the
-# sister unit SN JAIN INDUSTIRES PVT LTD-(C26)). The report's STITCHING column
-# carries figures far larger than the in-house `Stitching` godown alone can
-# explain, so these very likely belong in BUCKET_STITCHING. Left in
-# BUCKET_OTHER deliberately: guessing would quietly inflate availability and
-# suppress real reorder need. Confirm against the report, then move them.
+#     Job Worker         45 children   Aakash Trading, Guddu Dyeing, ...
+#     Stitching          42 children   A.K Enterprises, DHOOM CREATIONS, ...
+#     Job Worker-Cutter   6 children   the six Cutter-* godowns
+#     In Stock            2 children   Pack, Unpack
+#     PRODUCTION          2 children   Inhouse, Job Worker
+#
+# Rule confirmed by the owner: goods sitting with a job worker are STITCHING
+# WIP. That covers both trees — `Stitching` and `Job Worker` — while
+# `Job Worker-Cutter` stays with cutting. A leaf such as "DHOOM CREATIONS"
+# says nothing in its own name; only its parent does, which is why
+# classify_godown() must be given fetch_godown_parents() to work properly.
+#
+# Still unverified: whether these buckets reproduce the report's own column
+# totals. The item-level reconciliation CANNOT check this — it sums across
+# godowns, so a misplaced bucket cancels out inside the total and still
+# passes. Only a Reorder Report export settles it; use
+# validate_against_report() when one is available.
 
 BUCKET_STOCK = "in_stock"
 BUCKET_UNPACK = "unpack"
@@ -174,31 +180,85 @@ _EXACT_BUCKETS = {
     "main location": BUCKET_STOCK,
     "in stock": BUCKET_STOCK,
     "pack": BUCKET_STOCK,
-    "pack-e29": BUCKET_STOCK,
     "unpack": BUCKET_UNPACK,
-    "unpack-(c26)": BUCKET_UNPACK,
-    "unpack-e29": BUCKET_UNPACK,
     "v mart unpack": BUCKET_UNPACK,
+    # Parent godowns. Reached by walking up from a leaf, which is what makes
+    # the 87 job-worker godowns classify themselves.
     "stitching": BUCKET_STITCHING,
-    "cutting": BUCKET_CUTTING,
-    "cutting-e29": BUCKET_CUTTING,
+    "job worker": BUCKET_STITCHING,     # goods with a job worker = stitching WIP
     "job worker-cutter": BUCKET_CUTTING,
+    "cutting": BUCKET_CUTTING,
 }
 
 
-def classify_godown(name: str) -> str:
-    """Which reorder-report column a godown's stock belongs to."""
-    key = (name or "").strip().lower()
-    if not key:
+def fetch_godown_parents(cfg: TallyConfig) -> dict:
+    """{godown: parent godown} — the hierarchy classify_godown() walks."""
+    body = f"""<ENVELOPE>
+ <HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>
+  <TYPE>Collection</TYPE><ID>TB_GdnTree</ID></HEADER>
+ <BODY><DESC><STATICVARIABLES>
+   <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+   {_company_tag(cfg)}
+  </STATICVARIABLES>
+  <TDL><TDLMESSAGE>
+   <COLLECTION NAME="TB_GdnTree" ISMODIFY="No" ISFIXED="No" ISINITIALIZE="No" ISOPTION="No" ISINTERNAL="No">
+    <TYPE>Godown</TYPE><FETCH>Name,Parent</FETCH>
+   </COLLECTION>
+  </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
+    tree = {}
+    for g in _parse_xml(_post(cfg, body)).iter("GODOWN"):
+        name = g.get("NAME") or _text(g.find("NAME"))
+        if name:
+            tree[name] = _text(g.find("PARENT"))
+    log.info("Fetched parents for %d godowns", len(tree))
+    return tree
+
+
+def classify_godown(name: str, parents: dict | None = None) -> str:
+    """
+    Which reorder-report column a godown's stock belongs to.
+
+    Classification follows Tally's OWN godown hierarchy rather than guessing
+    from names, because this book already models the shop floor that way:
+    45 godowns sit under `Job Worker`, 42 under `Stitching`, the six cutters
+    under `Job Worker-Cutter`, and Pack/Unpack under `In Stock`. A leaf like
+    "DHOOM CREATIONS" carries no hint in its name — its parent does.
+
+    Pass `parents` from fetch_godown_parents(). Without it only leaf names can
+    be matched, and every job-worker godown falls to BUCKET_OTHER — which
+    understates stitching WIP and overstates reorder need.
+    """
+    seen: set[str] = set()
+    cur = (name or "").strip()
+    if not cur:
         return BUCKET_OTHER
-    if key in _EXACT_BUCKETS:
-        return _EXACT_BUCKETS[key]
-    if key.startswith("cutter-"):
-        return BUCKET_CUTTING
-    if key.startswith("inhouse"):
-        return BUCKET_STITCHING
-    if key.startswith("unpack"):
-        return BUCKET_UNPACK
+    for _ in range(8):
+        key = cur.lower()
+        if key in _EXACT_BUCKETS:
+            return _EXACT_BUCKETS[key]
+        if key.startswith("cutter-") or key.startswith("cutting"):
+            return BUCKET_CUTTING
+        if key.startswith("unpack"):
+            return BUCKET_UNPACK
+        if key.startswith("pack"):
+            return BUCKET_STOCK
+        # "Inhouse-*" are in-house stitching units: 40-odd of them already sit
+        # under the Stitching / Job Worker parents, and the two that hang off
+        # PRODUCTION and the E-29 branch are the same kind of place.
+        if key.startswith("inhouse"):
+            return BUCKET_STITCHING
+        # Owner's rule: goods with a job worker are stitching WIP. Catches the
+        # job-work godowns parented at the root rather than under Job Worker.
+        if key.startswith("jobwork") or key.startswith("job work"):
+            return BUCKET_STITCHING
+        if not parents:
+            break
+        nxt = parents.get(cur, "")
+        # "Primary" is Tally's synthetic root and classifies nothing.
+        if not nxt or nxt == "Primary" or nxt in seen:
+            break
+        seen.add(nxt)
+        cur = nxt
     return BUCKET_OTHER
 
 
@@ -245,7 +305,8 @@ def _movement_body(cfg: TallyConfig, frm: date, to: date, fields: str) -> str:
   </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
 
 
-def _batch_rows(entry, sign: int, head: dict, units: dict | None) -> list[Movement]:
+def _batch_rows(entry, sign: int, head: dict, units: dict | None,
+                parents: dict | None = None) -> list[Movement]:
     """Every batch allocation under one inventory entry, signed."""
     item = _text(entry.find("STOCKITEMNAME"))
     out: list[Movement] = []
@@ -267,13 +328,14 @@ def _batch_rows(entry, sign: int, head: dict, units: dict | None) -> list[Moveme
             voucher_type=head["voucher_type"],
             voucher_number=head["voucher_number"],
             item_name=item, size_batch=size, godown=godown,
-            bucket=classify_godown(godown),
+            bucket=classify_godown(godown, parents),
             qty=qty * sign, unit=unit, qty_raw=qty_raw or raw,
         ))
     return out
 
 
-def parse_movements(raw: str, units: dict | None = None) -> list[Movement]:
+def parse_movements(raw: str, units: dict | None = None,
+                    parents: dict | None = None) -> list[Movement]:
     """
     Signed per-(item, size, godown) movements out of a voucher export.
 
@@ -301,19 +363,21 @@ def parse_movements(raw: str, units: dict | None = None) -> list[Movement]:
         outs = vel.findall("INVENTORYENTRIESOUT.LIST")
         if ins or outs:
             for e in ins:
-                moves.extend(_batch_rows(e, +1, head, units))
+                moves.extend(_batch_rows(e, +1, head, units, parents))
             for e in outs:
-                moves.extend(_batch_rows(e, -1, head, units))
+                moves.extend(_batch_rows(e, -1, head, units, parents))
             continue
 
         for e in vel.findall("ALLINVENTORYENTRIES.LIST"):
             inward = _text(e.find("ISDEEMEDPOSITIVE")).lower() == "yes"
-            moves.extend(_batch_rows(e, +1 if inward else -1, head, units))
+            moves.extend(_batch_rows(e, +1 if inward else -1, head, units,
+                                     parents))
     return moves
 
 
 def fetch_movements(cfg: TallyConfig, frm: date, to: date,
-                    units: dict | None = None) -> list[Movement]:
+                    units: dict | None = None,
+                    parents: dict | None = None) -> list[Movement]:
     """
     Stock movements for a date window. One request.
 
@@ -323,7 +387,7 @@ def fetch_movements(cfg: TallyConfig, frm: date, to: date,
     """
     assert_company_loaded(cfg)
     raw = _post(cfg, _movement_body(cfg, frm, to, _MOVEMENT))
-    moves = parse_movements(raw, units)
+    moves = parse_movements(raw, units, parents)
     log.info("Fetched %d stock movements for %s..%s", len(moves), frm, to)
     return moves
 
@@ -352,7 +416,8 @@ def opening_from_masters(raw: str, units: dict | None = None) -> dict:
     return dict(opening)
 
 
-def derive_stock(opening: dict, movements: list[Movement]) -> dict:
+def derive_stock(opening: dict, movements: list[Movement],
+                 parents: dict | None = None) -> dict:
     """
     {(item, size, bucket): qty} — closing stock per reorder-report column.
 
@@ -362,7 +427,7 @@ def derive_stock(opening: dict, movements: list[Movement]) -> dict:
     """
     totals: dict[tuple[str, str, str], float] = defaultdict(float)
     for (item, size, godown), qty in opening.items():
-        totals[(item, size, classify_godown(godown))] += qty
+        totals[(item, size, classify_godown(godown, parents))] += qty
     for m in movements:
         totals[(m.item_name, m.size_batch, m.bucket)] += m.qty
     return dict(totals)
