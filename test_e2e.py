@@ -13,6 +13,9 @@ closes both gaps:
   * vouchers whose narrations carry control bytes, fake tags, stray & and <
   * a ledger whose email is a bare domain (the live InvalidEmailAddressError)
   * multi-chunk date ranges, per-row rejects, sync-log calls
+  * a TDL collection engine that answers the way the live server does, so the
+    request-shape probe has something real to choose between — then a second
+    pass against a build that scopes nothing, to keep the fallback covered
 
 Run:  python test_e2e.py
 """
@@ -21,10 +24,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -125,33 +130,41 @@ def stock_items_xml() -> str:
             + "</COLLECTION></DATA></BODY></ENVELOPE>")
 
 
-def bills_xml() -> str:
-    """Open bills. Debit-positive receivables export NEGATIVE, per Tally."""
+def bills_xml(company: str) -> str:
+    """
+    Open bills. Debit-positive receivables export NEGATIVE, per Tally.
+
+    Each company file holds its OWN parties. Serving one identical payload for
+    both files reproduces the TallyPrime defect where the Bills collection
+    answers from the loaded company regardless of SVCURRENTCOMPANY — which the
+    agent detects and refuses to write, so the second company mirrored nothing.
+    """
+    party = "Customer" if company == COMPANY else "Old Customer"
     rows = []
     # 40 overdue: dated 15-Apr with 45-day terms, so due 30-May.
     for i in range(40):
         rows.append(
-            f'<BILLS NAME="SL/{i:04d}"><PARENT>Customer {i:04d}</PARENT>'
+            f'<BILL NAME="SL/{i:04d}"><PARENT>{party} {i:04d}</PARENT>'
             f"<BILLDATE>20260415</BILLDATE>"
             f"<BILLCREDITPERIOD>45 Days</BILLCREDITPERIOD>"
             f"<OPENINGBALANCE>-{(i + 1) * 1000}.00</OPENINGBALANCE>"
             f"<CLOSINGBALANCE>-{(i + 1) * 1000}.00</CLOSINGBALANCE>"
-            f"<ISADVANCE>No</ISADVANCE></BILLS>"
+            f"<ISADVANCE>No</ISADVANCE></BILL>"
         )
     # 10 not yet due: dated 1-Aug with 3-month terms, so due 30-Oct.
     for i in range(40, 50):
         rows.append(
-            f'<BILLS NAME="SL/{i:04d}"><PARENT>Customer {i:04d}</PARENT>'
+            f'<BILL NAME="SL/{i:04d}"><PARENT>{party} {i:04d}</PARENT>'
             f"<BILLDATE>20260801</BILLDATE>"
             f"<BILLCREDITPERIOD>3 Months</BILLCREDITPERIOD>"
             f"<CLOSINGBALANCE>-{(i + 1) * 1000}.00</CLOSINGBALANCE>"
-            f"<ISADVANCE>No</ISADVANCE></BILLS>"
+            f"<ISADVANCE>No</ISADVANCE></BILL>"
         )
     # A customer advance — must never be counted as money owed to us.
     rows.append(
-        '<BILLS NAME="ADV/1"><PARENT>Customer 0001</PARENT>'
+        f'<BILL NAME="ADV/1"><PARENT>{party} 0001</PARENT>'
         "<BILLDATE>20260501</BILLDATE><CLOSINGBALANCE>25000.00</CLOSINGBALANCE>"
-        "<ISADVANCE>Yes</ISADVANCE></BILLS>"
+        "<ISADVANCE>Yes</ISADVANCE></BILL>"
     )
     return ("<ENVELOPE><BODY><DATA><COLLECTION>" + "".join(rows)
             + "</COLLECTION></DATA></BODY></ENVELOPE>")
@@ -218,48 +231,234 @@ def ledgers_xml() -> str:
             + "</COLLECTION></DATA></BODY></ENVELOPE>")
 
 
-def _voucher(guid, num, day, party, amount, narration):
-    return (
-        f'<VOUCHER VCHTYPE="Sales"><GUID>{guid}</GUID>'
-        f"<VOUCHERTYPENAME>Sales</VOUCHERTYPENAME>"
-        f"<VOUCHERNUMBER>{num}</VOUCHERNUMBER><DATE>{day}</DATE>"
-        f"<PARTYLEDGERNAME>{party}</PARTYLEDGERNAME>"
-        f"<NARRATION>{narration}</NARRATION>"
-        f"<ISCANCELLED>No</ISCANCELLED><ALTERID>1</ALTERID>"
-        f"<ALLLEDGERENTRIES.LIST><LEDGERNAME>{party}</LEDGERNAME>"
-        f"<ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-{amount}</AMOUNT>"
-        f"</ALLLEDGERENTRIES.LIST>"
-        f"<ALLLEDGERENTRIES.LIST><LEDGERNAME>Sales 0</LEDGERNAME>"
-        f"<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>{amount}</AMOUNT>"
-        f"</ALLLEDGERENTRIES.LIST></VOUCHER>"
-    )
+# ---------------------------------------------------------------------------
+# Mock Tally: the voucher book
+# ---------------------------------------------------------------------------
+
+# Each company file opens on its own financial year, as Tally reports it.
+COMPANY_START = {COMPANY: date(2026, 4, 1), OLD_COMPANY: date(2024, 4, 1)}
+
+# Narration pathologies the live book demonstrated, all at once.
+HOSTILE_NARRATIONS = (
+    "माल भेजा ₹500\x07 urgent",       # control byte after multi-byte text
+    "as per <PONO 123> confirmed",     # fake tag with a digit attribute
+    "M&M rate < 500 per pc",           # stray ampersand and comparison
+    "ref &#4; and &#27; done",         # invalid numeric refs
+    "adjusted <- see note &",          # arrow and trailing amp
+    "normal narration",                # plain sanity
+    "see </NARRATION> note above",     # text impersonating the real closer
+    "flagged <ok> by accounts",        # text impersonating an open tag
+)
 
 
-def vouchers_xml(chunk_key: str, day: str = "20260415") -> str:
-    """Every narration pathology the live book demonstrated, all at once."""
-    hostile = [
-        # control bytes after multi-byte text (byte-col != char-col)
-        "माल भेजा ₹500\x07 urgent",
-        # fake tag with digit attribute
-        "as per <PONO 123> confirmed",
-        # stray ampersand and comparison
-        "M&M rate < 500 per pc",
-        # invalid numeric refs
-        "ref &#4; and &#27; done",
-        # arrow and trailing amp
-        "adjusted <- see note &",
-        # plain sanity
-        "normal narration",
-        # structural killers: text impersonating real markup
-        "see </NARRATION> note above",
-        "flagged <ok> by accounts",
-    ]
-    vs = "".join(
-        _voucher(f"{chunk_key}-g{i}", f"SL/{i:03d}", day,
-                 f"Customer {i:04d}", f"{(i + 1) * 118}.00", hostile[i % len(hostile)])
+def voucher_book(company: str) -> list:
+    """
+    The vouchers one company file holds, dated across its year like a book.
+
+    The DATES are load-bearing. _pick_voucher_variant classifies a request
+    shape by experiment: it asks for two three-day windows — the company's
+    opening days, and days 45-47 — and only accepts a shape whose two answers
+    DIFFER. This mock used to date every voucher 15-Apr, so both windows came
+    back empty, every shape was judged broken, and the suite could exercise
+    nothing but the whole-company fallback. A book has to look like a book.
+    """
+    start = COMPANY_START[company]
+    key = "apr" if company == COMPANY else "old"
+    book = [
+        {
+            "guid": f"{key}-g{i}",
+            "number": f"SL/{i:03d}",
+            # Every other day, so both probe windows are populated and no two
+            # monthly chunks can claim the same voucher.
+            "date": start + timedelta(days=i * 2),
+            "party": f"Customer {i:04d}",
+            "amount": f"{(i + 1) * 118}.00",
+            "narration": HOSTILE_NARRATIONS[i % len(HOSTILE_NARRATIONS)],
+            # A purchase order predating the voucher — and, for the first few,
+            # predating the book itself, which is ordinary in a real file.
+            "reference": f"PO/{key}/{i:03d}",
+            "reference_date": start + timedelta(days=i * 2 - 7),
+            "alter_id": 100 + i,
+        }
         for i in range(60)
-    )
-    return f"<ENVELOPE><BODY><DATA><TALLYMESSAGE>{vs}</TALLYMESSAGE></DATA></BODY></ENVELOPE>"
+    ]
+    # Cancelled and optional vouchers: the reason the rich field set exists.
+    # The shape the agent picks filters on DATE only, so these arrive and must
+    # be mirrored CARRYING their flags. The whole-company fallback asks Tally
+    # to drop them server-side instead. Both are correct; they differ, and the
+    # suite pins both.
+    book.append({
+        "guid": f"{key}-cancelled", "number": "SL/900",
+        "date": start + timedelta(days=10), "party": "Customer 0005",
+        "amount": "9999.00", "narration": "cancelled by accounts",
+        "reference": "", "reference_date": None, "alter_id": 900,
+        "is_cancelled": True,
+    })
+    book.append({
+        "guid": f"{key}-optional", "number": "SL/901",
+        "date": start + timedelta(days=12), "party": "Customer 0006",
+        "amount": "8888.00", "narration": "optional, not posted",
+        "reference": "", "reference_date": None, "alter_id": 901,
+        "is_optional": True,
+    })
+    return book
+
+
+# The Day Book defect, verbatim from the live server: the report ignores
+# SVFROMDATE/SVTODATE and answers every window with the current day's data —
+# which filed one Receipt under five different months on 2026-08-11.
+STUCK_DAYBOOK_VOUCHER = {
+    "guid": "stuck-day-guid", "number": "RC/001", "date": date(2026, 8, 10),
+    "party": "Customer 0001", "amount": "40000.00", "type": "Receipt",
+    "narration": "same day every time", "reference": "",
+    "reference_date": None, "alter_id": 1,
+}
+
+# <FETCH> field name -> the tag Tally answers with. A real Tally emits ONLY
+# what was fetched, which is the whole point of the proven/rich split: asking
+# for Narration is what makes NARRATION appear at all.
+_FETCH_TAGS = {
+    "Guid": "GUID",
+    "Date": "DATE",
+    "VoucherTypeName": "VOUCHERTYPENAME",
+    "VoucherNumber": "VOUCHERNUMBER",
+    "PartyLedgerName": "PARTYLEDGERNAME",
+    "Narration": "NARRATION",
+    "Reference": "REFERENCE",
+    "ReferenceDate": "REFERENCEDATE",
+    "IsInvoice": "ISINVOICE",
+    "IsCancelled": "ISCANCELLED",
+    "IsOptional": "ISOPTIONAL",
+    "AlterID": "ALTERID",
+}
+_ENTRY_FETCH = {"AllLedgerEntries.LedgerName", "AllLedgerEntries.Amount",
+                "AllLedgerEntries.IsDeemedPositive"}
+_ALL_FETCH = set(_FETCH_TAGS) | _ENTRY_FETCH
+
+_RE_FETCH = re.compile(r"<FETCH>([^<]*)</FETCH>")
+_RE_FILTER = re.compile(r"<FILTER>([^<]*)</FILTER>")
+_RE_FORMULA = re.compile(r'<SYSTEM TYPE="Formulae" NAME="([^"]+)">(.*?)</SYSTEM>',
+                         re.S)
+_RE_DATE_LIT = re.compile(r'\$\$Date:"([^"]+)"')
+
+# Flipped for the second pass, which forces the whole-company fallback.
+MOCK = {"honours_date_filter": True}
+
+
+def _vch_xml(v: dict, fields: set) -> str:
+    """One voucher, carrying ONLY the fields the request asked for."""
+    vals = {
+        "Guid": v["guid"],
+        "Date": v["date"].strftime("%Y%m%d"),
+        "VoucherTypeName": v.get("type", "Sales"),
+        "VoucherNumber": v["number"],
+        "PartyLedgerName": v["party"],
+        "Narration": v["narration"],
+        "Reference": v.get("reference") or "",
+        "ReferenceDate": (v["reference_date"].strftime("%Y%m%d")
+                          if v.get("reference_date") else ""),
+        "IsInvoice": "Yes",
+        "IsCancelled": "Yes" if v.get("is_cancelled") else "No",
+        "IsOptional": "Yes" if v.get("is_optional") else "No",
+        "AlterID": str(v.get("alter_id", 1)),
+    }
+    parts = [f'<VOUCHER VCHTYPE="{vals["VoucherTypeName"]}" ACTION="Create">']
+    for name, tag in _FETCH_TAGS.items():
+        if name in fields:
+            parts.append(f"<{tag}>{vals[name]}</{tag}>")
+    if fields & _ENTRY_FETCH:
+        amt = v["amount"]
+        parts.append(
+            f'<ALLLEDGERENTRIES.LIST><LEDGERNAME>{v["party"]}</LEDGERNAME>'
+            f"<ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE><AMOUNT>-{amt}</AMOUNT>"
+            f"</ALLLEDGERENTRIES.LIST>"
+            f'<ALLLEDGERENTRIES.LIST><LEDGERNAME>Sales 0</LEDGERNAME>'
+            f"<ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE><AMOUNT>{amt}</AMOUNT>"
+            f"</ALLLEDGERENTRIES.LIST>")
+    parts.append("</VOUCHER>")
+    return "".join(parts)
+
+
+def _collection_xml(rows: list, fields: set) -> str:
+    return ("<ENVELOPE><BODY><DATA><COLLECTION>"
+            + "".join(_vch_xml(v, fields) for v in rows)
+            + "</COLLECTION></DATA></BODY></ENVELOPE>")
+
+
+def _lit_date(s: str):
+    """A $$Date literal, in either form a real Tally accepts."""
+    for fmt in ("%Y%m%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _apply_formula(formula: str, rows: list):
+    """Evaluate the handful of TDL formulae this agent actually sends."""
+    if "$Date" in formula and "$$Date:" in formula:
+        if not MOCK["honours_date_filter"]:
+            # A build that accepts the filter and scopes nothing by it —
+            # every row, every window. This is what the whole-company
+            # fallback exists for, and the second pass proves it still works.
+            return rows
+        lits = [_lit_date(s) for s in _RE_DATE_LIT.findall(formula)]
+        if len(lits) != 2 or None in lits:
+            # An unrecognised date literal costs the whole collection: zero
+            # rows, no error, in about 140ms.
+            return []
+        lo, hi = lits
+        return [r for r in rows if lo <= r["date"] <= hi]
+    if "$IsCancelled" in formula:
+        return [r for r in rows if not r.get("is_cancelled")]
+    if "$IsOptional" in formula:
+        return [r for r in rows if not r.get("is_optional")]
+    # A formula referencing something this build cannot evaluate returns
+    # nothing at all — indistinguishable from "the filter matched nothing".
+    return []
+
+
+def voucher_collection_xml(body: str, company: str) -> str:
+    """
+    Answer a TDL voucher Collection the way the live server does.
+
+    The shape study.py verified on 2026-08-12 — 4,595 vouchers for April 2026,
+    every one inside the window — is: a SINGULAR comma-joined <FILTER>, exactly
+    one comma-joined <FETCH>, and the window expressed as $$Date literals in a
+    <SYSTEM TYPE="Formulae">, with no SVFROMDATE anywhere. Get any of it wrong
+    and Tally does not complain. It answers with the whole collection,
+    unfiltered — which is exactly how a broken request passed for a working one
+    for two days, so that leak is reproduced here rather than smoothed over.
+    """
+    rows = voucher_book(company)
+    fetches = _RE_FETCH.findall(body)
+    filters = _RE_FILTER.findall(body)
+
+    # <FILTERS> plural, or the multi-<FETCH> form (which belongs to FETCHLIST
+    # at DESC level): both silently ignored, whole collection returned.
+    if len(fetches) != 1 or len(filters) != 1:
+        return _collection_xml(rows, _ALL_FETCH)
+
+    fields = {f.strip() for f in fetches[0].split(",") if f.strip()}
+    if fields - _ALL_FETCH:
+        # One unrecognised FETCH field and the collection answers zero rows —
+        # no error, and no clue which field. That ambiguity is why the agent
+        # tries the proven field set before the rich one.
+        return _collection_xml([], fields)
+
+    formulae = dict(_RE_FORMULA.findall(body))
+    for name in (n.strip() for n in filters[0].split(",") if n.strip()):
+        if name not in formulae:
+            # An undefined filter name scopes nothing.
+            return _collection_xml(voucher_book(company), fields)
+        rows = _apply_formula(formulae[name], rows)
+    return _collection_xml(rows, fields)
+
+
+def _company_of(body: str) -> str:
+    """Which company file the request is scoped to."""
+    return OLD_COMPANY if OLD_COMPANY in body else COMPANY
 
 
 class TallyHandler(BaseHTTPRequestHandler):
@@ -291,7 +490,7 @@ class TallyHandler(BaseHTTPRequestHandler):
             if "BillFixed" in body:
                 payload = "<ENVELOPE><BODY><DATA><LINEERROR>Unknown method BillFixed</LINEERROR></DATA></BODY></ENVELOPE>"
             else:
-                payload = bills_xml()
+                payload = bills_xml(_company_of(body))
         elif "TB_Groups" in body:
             payload = groups_xml()
         elif "TB_Ledgers" in body:
@@ -311,38 +510,20 @@ class TallyHandler(BaseHTTPRequestHandler):
             else:
                 payload = ledgers_xml()
         elif "Day Book" in body:
-            # Emulate the LIVE defect: Day Book ignores SVFROMDATE/SVTODATE
-            # and always returns the same single "today" voucher — exactly
-            # what served one Receipt for every monthly window on 2026-08-11.
+            # The LIVE defect: Day Book ignores SVFROMDATE/SVTODATE and always
+            # answers with the same single "today" voucher — exactly what
+            # served one Receipt for every monthly window on 2026-08-11. A
+            # report export really does come back inside <TALLYMESSAGE>.
             payload = ("<ENVELOPE><BODY><DATA><TALLYMESSAGE>"
-                       + _voucher("stuck-day-guid", "RC/001", "20260810",
-                                  "Customer 0001", "40000.00", "same day every time")
+                       + _vch_xml(STUCK_DAYBOOK_VOUCHER, _ALL_FETCH)
                        + "</TALLYMESSAGE></DATA></BODY></ENVELOPE>")
-        elif "TB_VchAll" in body:
-            # The guaranteed fallback: everything, unscoped. The agent filters.
-            payload = (vouchers_xml("old", "20240415") if OLD_COMPANY in body
-                       else vouchers_xml("apr", "20260415"))
-        elif "TB_Vouchers" in body:
-            # Emulate a CORRECT Tally: honour the TDL filter, but only if the
-            # request is well formed. A malformed one (plural <FILTERS>, or
-            # multiple <FETCH> tags) returns everything unfiltered — exactly
-            # how the live server behaved.
-            import re as _re
-            well_formed = (bool(_re.search(r"<FILTER>[^<]+</FILTER>", body))
-                           and body.count("<FETCH>") == 1)
-            lits = _re.findall(r'\$\$Date:"(\d{8})"', body)
-            if not well_formed or len(lits) != 2:
-                # Unfiltered: every voucher, both companies' worth.
-                payload = vouchers_xml("leak", "20260415")
-            else:
-                frm_s, to_s = lits
-                def _covers(day): return frm_s <= day <= to_s
-                if OLD_COMPANY in body:
-                    payload = (vouchers_xml("old", "20240415") if _covers("20240415") else
-                               "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
-                else:
-                    payload = (vouchers_xml("apr", "20260415") if _covers("20260415")
-                               else "<ENVELOPE><BODY><DATA><TALLYMESSAGE></TALLYMESSAGE></DATA></BODY></ENVELOPE>")
+        elif "TB_VchAll" in body or "TB_Vouchers" in body:
+            # Both the date-scoped collection and the unscoped whole-company
+            # fallback are ordinary TDL collections, and the same engine
+            # answers both — TB_VchAll simply carries the hygiene filters and
+            # no period formula, so Tally drops cancelled and optional rows
+            # server-side there.
+            payload = voucher_collection_xml(body, _company_of(body))
         else:
             payload = "<ENVELOPE></ENVELOPE>"
         raw = payload.encode("utf-8")
@@ -434,6 +615,19 @@ class FrappeHandler(BaseHTTPRequestHandler):
         return self._json({"exc": "unknown"}, 404)
 
 
+def run_sync(workdir: Path):
+    """The exact command the operator types, as a real subprocess."""
+    return subprocess.run(
+        [sys.executable, str(HERE / "sync.py"), "--full",
+         "--config", str(workdir / "config.toml")],
+        capture_output=True, text=True, timeout=300, cwd=str(workdir),
+        # The mock has no Tally engine to overwhelm, so skip the inter-request
+        # pacing the real server needs. Without this the suite spends minutes
+        # sleeping and creeps up on the timeout above.
+        env={**os.environ, "TALLY_MIN_REQUEST_GAP": "0"},
+    )
+
+
 def main() -> int:
     t_srv = HTTPServer(("127.0.0.1", TALLY_PORT), TallyHandler)
     f_srv = HTTPServer(("127.0.0.1", FRAPPE_PORT), FrappeHandler)
@@ -454,15 +648,7 @@ def main() -> int:
     print("END-TO-END: python sync.py --full   (as a real subprocess)")
     print("=" * 62)
 
-    proc = subprocess.run(
-        [sys.executable, str(HERE / "sync.py"), "--full",
-         "--config", str(workdir / "config.toml")],
-        capture_output=True, text=True, timeout=300, cwd=str(workdir),
-        # The mock has no Tally engine to overwhelm, so skip the inter-request
-        # pacing the real server needs. Without this the suite spends minutes
-        # sleeping and creeps up on the timeout above.
-        env={**os.environ, "TALLY_MIN_REQUEST_GAP": "0"},
-    )
+    proc = run_sync(workdir)
     out = (proc.stdout or "") + (proc.stderr or "")
 
     print()
@@ -498,9 +684,27 @@ def main() -> int:
     orphan = next(r for r in store["ledgers"] if r["name"] == "Orphan Ledger")
     check("unknown group degrades to itself", orphan["primary_group"], "MYSTERY GROUP")
 
-    # Vouchers: all 60 hostile-narration vouchers must land.
+    # Vouchers: all 60 hostile-narration vouchers must land, plus the
+    # cancelled and optional pair — the chosen shape filters on date only, so
+    # Tally hands those over and the agent mirrors them carrying their flags.
+    mirrored = [v for v in store["vouchers"] if v.get("company") == COMPANY]
     check("vouchers mirrored despite hostile narrations",
-          len([v for v in store["vouchers"] if v.get("company") == COMPANY]), 60)
+          len([v for v in mirrored
+               if not v["is_cancelled"] and not v["is_optional"]]), 60)
+    check("cancelled and optional vouchers mirrored WITH their flags",
+          len([v for v in mirrored if v["is_cancelled"] or v["is_optional"]]), 2)
+    guids = [v["guid"] for v in mirrored]
+    check("no voucher claimed by two chunks", len(guids), len(set(guids)))
+    check_true("no rows leaked across a chunk boundary",
+               "leaks rows across range boundaries" not in out)
+
+    # The rich field set is what separates filter_dotted_rich from the proven
+    # shape, and it only proves anything if the fields actually arrive.
+    v0 = next(v for v in mirrored if v["guid"] == "apr-g0")
+    check("reference captured (rich field)", v0["reference"], "PO/apr/000")
+    check("reference date captured (rich field)", v0["reference_date"], "2026-03-25")
+    check("alter id captured (rich field)", v0["alter_id"], "100")
+    check("voucher dated where the book puts it", v0["date"], "2026-04-01")
     check_true("voucher entries preserved",
                all(len(v.get("entries", [])) == 2 for v in store["vouchers"]))
     check_true("voucher amounts positive (sum of debits)",
@@ -517,7 +721,11 @@ def main() -> int:
     check("prior-year ledgers synced", len(old_ledgers), 2)
     old_vouchers = [v for v in store["vouchers"] if v.get("company") == OLD_COMPANY]
     check("prior-year vouchers synced (range floored at ITS year)",
-          len(old_vouchers), 60)
+          len([v for v in old_vouchers
+               if not v["is_cancelled"] and not v["is_optional"]]), 60)
+    check_true("prior-year vouchers dated in ITS year",
+               all(v["date"].startswith("2024") for v in old_vouchers),
+               sorted({v["date"][:4] for v in old_vouchers}))
 
     # Structural narration attacks: a narration containing a literal
     # "</NARRATION>" is truncated at that point (the parser cannot tell the
@@ -543,6 +751,13 @@ def main() -> int:
                "verified against two" in out, out[-400:])
     check_true("a TDL-filtered request was chosen",
                "using 'filter" in out, out[-400:])
+    # And specifically the richest one: this build accepts IsCancelled,
+    # IsOptional, AlterID, Narration, Reference and ReferenceDate, so the
+    # probe must never settle for the narrow shape here.
+    check_true("the rich variant was the one verified",
+               "using 'filter_dotted_rich'" in out, out[-400:])
+    check_true("the whole-company fallback was NOT needed",
+               "Falling back to fetching the whole company" not in out)
     check_true("the stuck same-day voucher never entered the mirror",
                not any(v.get("guid") == "stuck-day-guid" for v in store["vouchers"]))
 
@@ -620,6 +835,42 @@ def main() -> int:
     check_true("sync log recorded", len(store["logs"]) >= 1)
     check_true("status Success", any(l.get("status") == "Success" for l in store["logs"]),
                f"statuses: {[l.get('status') for l in store['logs']]}")
+
+    # -----------------------------------------------------------------
+    # Second pass: a build that accepts the filter and scopes nothing by it.
+    #
+    # Every request shape is then demonstrably broken, and the agent must fall
+    # back to fetching each company once and filtering the dates here. That
+    # fallback is the only thing this suite could exercise while the mock was
+    # built to reject everything; now that the primary path is covered, this
+    # keeps the fallback covered too instead of trading one for the other.
+    # -----------------------------------------------------------------
+    print()
+    print("--- second pass: a build whose filter does not scope by date ---")
+    MOCK["honours_date_filter"] = False
+    for k in ("ledgers", "vouchers", "bills", "logs"):
+        store[k] = []
+    proc2 = run_sync(workdir)
+    out2 = (proc2.stdout or "") + (proc2.stderr or "")
+
+    check("fallback pass exit code", proc2.returncode, 0)
+    check_true("no traceback in the fallback pass", "Traceback" not in out2,
+               out2[-800:] if "Traceback" in out2 else "")
+    check_true("no shape honoured the range, so the fallback was chosen",
+               "Falling back to fetching the whole company" in out2, out2[-400:])
+    fb = [v for v in store["vouchers"] if v.get("company") == COMPANY]
+    # 60, not 62: the fallback request carries the hygiene filters, so Tally
+    # drops the cancelled and optional rows server-side rather than handing
+    # them over flagged. Both routes are correct and they differ — which is
+    # exactly the sort of difference this suite exists to hold still.
+    check("fallback mirrored the whole book, filtered here", len(fb), 60)
+    check_true("fallback dropped cancelled/optional server-side",
+               not any(v["is_cancelled"] or v["is_optional"] for v in fb))
+    check_true("fallback still never mirrors the stuck Day Book voucher",
+               not any(v.get("guid") == "stuck-day-guid" for v in store["vouchers"]))
+    fb_guids = [v["guid"] for v in fb]
+    check("fallback filtered by date without double-counting",
+          len(fb_guids), len(set(fb_guids)))
 
     print()
     if failures:
