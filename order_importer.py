@@ -72,7 +72,7 @@ from frappe_client import FrappeClient, FrappeError
 from tally_client import (
     TallyError,
     _fmt_date,
-    _post,
+    post_write,
     _xml_escape,
     assert_company_loaded,
     fetch_ledgers,
@@ -854,7 +854,7 @@ def import_order(fc: FrappeClient, cfg, o: dict, xml: str) -> str:
     cfg.company = o["company"]
     _assert_sales_order(xml)                      # the whitelist, every send
     try:
-        resp = _post(cfg, xml, attempts=1)
+        resp = post_write(cfg, xml)
     except TallyError as exc:
         msg = str(exc)
         if "line error" in msg.lower():

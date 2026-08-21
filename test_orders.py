@@ -193,6 +193,52 @@ check_raises(
     lambda: normalise_order(queue_rows(rate=0)),
     exc=OrderDataError, contains="not positive")
 
+print("writes are never retried")
+# A replayed import is how PR-MAHATMA came to exist three times in the live
+# book on 2026-08-21: _post retries 4x on any RequestException, and a POST
+# that times out may already have committed inside Tally. Reads may retry;
+# writes must go out exactly once and then be VERIFIED.
+import tally_client
+from tally_client import TallyConfig, TallyError, post_write
+
+_sent = {"n": 0}
+
+
+def _refuse(*_a, **_k):
+    _sent["n"] += 1
+    raise tally_client.requests.exceptions.ReadTimeout("read timed out")
+
+
+_saved_post = tally_client.requests.post
+tally_client.requests.post = _refuse
+_dead = TallyConfig(host="127.0.0.1", port=9, company="X", timeout=1)
+try:
+    check_raises("a timed-out write raises", lambda: post_write(_dead, "<E/>"),
+                 exc=TallyError, contains="NOT retried")
+    check("a timed-out write is sent exactly ONCE", _sent["n"], 1)
+
+    _sent["n"] = 0
+    try:
+        tally_client._post(_dead, "<E/>", attempts=2)
+    except TallyError:
+        pass
+    check("a read still retries", _sent["n"], 2)
+
+
+    class _LineError:
+        status_code = 200
+        content = b"<ENVELOPE><LINEERROR>totals do not match</LINEERROR></ENVELOPE>"
+
+    tally_client.requests.post = lambda *_a, **_k: _LineError()
+    # Tally answered and refused, so nothing was written. That must NOT be
+    # dressed up as "may already have committed", and order_importer keys its
+    # clean-failure branch off the words "line error".
+    check_raises("a rejected write is reported as a clean line error",
+                 lambda: post_write(_dead, "<E/>"),
+                 exc=TallyError, contains="line error")
+finally:
+    tally_client.requests.post = _saved_post
+
 print()
 if FAILED:
     print(f"{FAILED} check(s) FAILED.")
