@@ -27,8 +27,12 @@ company "SN JAIN INDUSTRIES PVT LTD - (26-27)", probed 2026-08-21):
     an empty GODOWNNAME and silently buckets to nothing — which is what
     `_inventory_lines()` in distributor_fetch does today.
 
-  * QUANTITIES ARE UNSIGNED. Every ACTUALQTY in the book is positive; there
-    is not one negative value. Direction therefore never comes from the sign.
+  * Quantities are USUALLY unsigned — direction normally comes from which
+    list a line sits in, not from its sign. But not always: reversals post as
+    NEGATIVE lines inside the IN list (measured: Stock Transfer #STP carries
+    -39.00 Box in INVENTORYENTRIESIN). So the line's own sign and the list's
+    direction MULTIPLY. An abs() here silently doubles the error on every
+    such line, and a short sample will not contain one.
 
   * `ALLINVENTORYENTRIES.LIST` is the UNION of the in and out lists:
     measured ALL == IN + OUT on every stock journal / transfer inspected.
@@ -252,13 +256,19 @@ def _batch_rows(entry, sign: int, head: dict, units: dict | None) -> list[Moveme
         godown = _text(b.find("GODOWNNAME"))
         if not item or qty in (None, 0):
             continue
+        # NEVER abs() this. Tally does write genuinely negative quantities —
+        # a reversal posts as a negative line inside the IN list rather than
+        # as a line in OUT (measured: Stock Transfer #STP, -39.00 Box in
+        # INVENTORYENTRIESIN). Taking the magnitude flips such a line's
+        # direction and doubles its error. The line's own sign and the list's
+        # direction multiply; they do not override one another.
         out.append(Movement(
             guid=head["guid"], date=head["date"],
             voucher_type=head["voucher_type"],
             voucher_number=head["voucher_number"],
             item_name=item, size_batch=size, godown=godown,
             bucket=classify_godown(godown),
-            qty=abs(qty) * sign, unit=unit, qty_raw=qty_raw or raw,
+            qty=qty * sign, unit=unit, qty_raw=qty_raw or raw,
         ))
     return out
 
