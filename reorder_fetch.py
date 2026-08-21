@@ -158,15 +158,30 @@ STOCK_VOUCHER_TYPES = [
 #     In Stock            2 children   Pack, Unpack
 #     PRODUCTION          2 children   Inhouse, Job Worker
 #
-# Rule confirmed by the owner: goods sitting with a job worker are STITCHING
-# WIP. That covers both trees — `Stitching` and `Job Worker` — while
-# `Job Worker-Cutter` stays with cutting. A leaf such as "DHOOM CREATIONS"
-# says nothing in its own name; only its parent does, which is why
-# classify_godown() must be given fetch_godown_parents() to work properly.
+# Rules confirmed by the owner (2026-08-21):
+#
+#   * Goods sitting with a JOB WORKER are STITCHING WIP. That covers both the
+#     `Stitching` and `Job Worker` trees; `Job Worker-Cutter` stays cutting.
+#     A leaf like "DHOOM CREATIONS" says nothing in its own name — only its
+#     parent does, which is why classify_godown() needs fetch_godown_parents().
+#   * `Bra Mold` is a stitching stage.
+#   * PRESSING and PACKING godowns are WIP, NOT final stock. Note the trap:
+#     the `Pack` godown holds packed output (final stock), while
+#     "SHNAWAZ (PACKING) C-26" is where packing is being DONE (WIP). Names
+#     that differ by three letters mean opposite things, so the WIP test runs
+#     before the "pack..." test.
+#   * FINAL STOCK EXISTS ONLY ONCE GOODS ARE PACKED.
+#
+#   * `Main Location` IS final stock — it is the godown sale bills are raised
+#     from. Confirmed against the book: a day's sale-type vouchers bill out of
+#     `Pack` (720 batch rows) and `Main Location` (48), and nothing else that
+#     counts as available.
 #
 # Still unverified: whether these buckets reproduce the report's own column
-# totals. The item-level reconciliation CANNOT check this — it sums across
-# godowns, so a misplaced bucket cancels out inside the total and still
+# totals, and whether the report folds BUCKET_WIP into its STITCHING column
+# (reorder_rows() assumes it does, since both are pipeline stock that must not
+# be re-cut). The item-level reconciliation CANNOT check any of this — it sums
+# across godowns, so a misplaced bucket cancels out inside the total and still
 # passes. Only a Reorder Report export settles it; use
 # validate_against_report() when one is available.
 
@@ -174,6 +189,7 @@ BUCKET_STOCK = "in_stock"
 BUCKET_UNPACK = "unpack"
 BUCKET_STITCHING = "stitching"
 BUCKET_CUTTING = "cutting"
+BUCKET_WIP = "wip"          # pressing / packing-in-progress: made, not packed
 BUCKET_OTHER = "other"
 
 _EXACT_BUCKETS = {
@@ -181,7 +197,15 @@ _EXACT_BUCKETS = {
     "in stock": BUCKET_STOCK,
     "pack": BUCKET_STOCK,
     "unpack": BUCKET_UNPACK,
-    "v mart unpack": BUCKET_UNPACK,
+    "bra mold": BUCKET_STITCHING,      # owner: a stitching stage
+    # BOTH V-Mart godowns are consignment ALREADY DISPATCHED: gone from the
+    # factory, unavailable to fill an order, and they must never count toward
+    # availability. Listed explicitly rather than left to fall through to
+    # BUCKET_OTHER, so they read as decisions instead of oversights. The
+    # "UNPACK" in the name is a trap — it describes V-Mart-side handling, not
+    # this factory's unpack stage, so it must NOT join BUCKET_UNPACK.
+    "v mart": BUCKET_OTHER,
+    "v mart unpack": BUCKET_OTHER,
     # Parent godowns. Reached by walking up from a leaf, which is what makes
     # the 87 job-worker godowns classify themselves.
     "stitching": BUCKET_STITCHING,
@@ -236,6 +260,12 @@ def classify_godown(name: str, parents: dict | None = None) -> str:
         key = cur.lower()
         if key in _EXACT_BUCKETS:
             return _EXACT_BUCKETS[key]
+        # Pressing and packing-in-progress are WIP, not sellable stock — goods
+        # only become final stock once PACKED. Checked before the "pack..."
+        # rule below so "SHNAWAZ (PACKING) C-26" is not mistaken for the `Pack`
+        # godown: one is the act of packing, the other is packed output.
+        if "pressing" in key or "packing" in key:
+            return BUCKET_WIP
         if key.startswith("cutter-") or key.startswith("cutting"):
             return BUCKET_CUTTING
         if key.startswith("unpack"):
@@ -465,6 +495,7 @@ def reorder_rows(stock: dict, pending: dict, levels: dict) -> list[dict]:
         in_stock = stock.get((item, size, BUCKET_STOCK), 0.0)
         unpack = stock.get((item, size, BUCKET_UNPACK), 0.0)
         stitching = stock.get((item, size, BUCKET_STITCHING), 0.0)
+        wip = stock.get((item, size, BUCKET_WIP), 0.0)
         pend = pending.get((item, size), 0.0)
         level = levels.get((item, size))
         rows.append({
@@ -473,11 +504,12 @@ def reorder_rows(stock: dict, pending: dict, levels: dict) -> list[dict]:
             "in_stock": in_stock,
             "unpack": unpack,
             "stitching": stitching,
+            "wip": wip,
             "cutting": stock.get((item, size, BUCKET_CUTTING), 0.0),
             "pending_order": pend,
             "reorder_level": level or 0.0,
             "has_level": level is not None,
-            "deficit": in_stock + unpack + stitching - pend - (level or 0.0),
+            "deficit": in_stock + unpack + stitching + wip - pend - (level or 0.0),
         })
     return rows
 
