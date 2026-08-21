@@ -423,6 +423,13 @@ def _company_tag(cfg: TallyConfig) -> str:
     return f"<SVCURRENTCOMPANY>{_xml_escape(cfg.company)}</SVCURRENTCOMPANY>"
 
 
+# How long to tolerate a company that is still opening. Short enough that a
+# genuinely closed company fails fast, long enough to cover a hosted Tally
+# finishing a load.
+_LOAD_WAIT_ATTEMPTS = 4
+_LOAD_WAIT_SECONDS = 3
+
+
 def assert_company_loaded(cfg: TallyConfig) -> None:
     """
     Verify the requested company is actually open in Tally before reading it.
@@ -432,10 +439,29 @@ def assert_company_loaded(cfg: TallyConfig) -> None:
     loaded company's rows, or zero rows, with a success status either way.
     Neither is distinguishable from a legitimate result, so the load state has
     to be checked explicitly.
+
+    Opening a company is not instantaneous — a hosted TallyPrime answers
+    requests while it is still loading, and reports NO open companies for
+    those few seconds (observed on TallyPrimeCloud, 2026-08-21). An
+    unattended run that happened to fire in that gap would abort for no real
+    reason, so a company that is merely slow to appear is waited for. A
+    company that is genuinely closed still fails, and fails closed.
     """
-    open_names = [c["name"] for c in list_companies(cfg)]
-    if cfg.company in open_names:
-        return
+    open_names: list[str] = []
+    for attempt in range(_LOAD_WAIT_ATTEMPTS):
+        open_names = [c["name"] for c in list_companies(cfg)]
+        if cfg.company in open_names:
+            if attempt:
+                log.info("Company %r appeared after %.0fs — it was still "
+                         "loading.", cfg.company, attempt * _LOAD_WAIT_SECONDS)
+            return
+        if attempt < _LOAD_WAIT_ATTEMPTS - 1 and not open_names:
+            # Empty list means "nothing loaded yet", which is the state worth
+            # waiting through. A NON-empty list naming other companies is a
+            # real mis-binding, so that fails immediately.
+            time.sleep(_LOAD_WAIT_SECONDS)
+            continue
+        break
     raise TallyError(
         f"Company {cfg.company!r} is not open in Tally, so its data cannot be "
         f"read safely.\nOpen in Tally right now: "
