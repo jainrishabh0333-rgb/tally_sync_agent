@@ -214,6 +214,7 @@ def normalise_order(raw: dict) -> dict:
             g = grouped.setdefault(item, {"item": item,
                                           "unit": str(ln.get("unit") or "Doz"),
                                           "rate": ln.get("rate"),
+                                          "dealer": str(ln.get("dealer") or "").strip(),
                                           "sizes": []})
             # The rate belongs to the item line, but the queue stores one row
             # per size — so every row for an item must agree, or the price
@@ -282,7 +283,8 @@ def normalise_order(raw: dict) -> dict:
                 f"line {i} ({item}): rate {ln.get('rate')!r} is not positive"
             )
         lines.append({"item": item, "unit": unit, "qty": total,
-                      "sizes": sizes, "rate": rate})
+                      "sizes": sizes, "rate": rate,
+                      "dealer": str(ln.get("dealer") or "").strip()})
 
     return {
         "order_key": key,
@@ -290,6 +292,7 @@ def normalise_order(raw: dict) -> dict:
         "company": company,
         "party": party,
         "order_date": order_date,
+        "narration": str(raw.get("narration") or "").strip(),
         "lines": lines,
     }
 
@@ -383,6 +386,7 @@ def _assert_sales_order(xml: str) -> None:
 # writes only the FIRST step in the DISCOUNT tag and the fully-netted figure
 # in AMOUNT, so that is what is written back.
 DISCOUNT_FIRST = 50.0
+DISCOUNT_SECOND = 20.0   # shown per line via UDF:EISPCLDIS; already netted in AMOUNT
 NET_FACTOR = 0.4
 _MONEY_TOL = 0.02
 
@@ -507,6 +511,13 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
                 f"     <ORDERNO>{esc(o['order_no'])}</ORDERNO>\n"
                 + (f"     <BATCHRATE>{rate:.2f}/{esc(ln['unit'])}</BATCHRATE>\n"
                    f"     <BATCHDISCOUNT>{DISCOUNT_FIRST:g}</BATCHDISCOUNT>\n"
+                   # second-discount column of the SO form reads this batch
+                   # UDF (shape from live SO/M3/220, 2026-08-21)
+                   f"     <UDF:BATCHDISCOUNT2.LIST DESC=\"`BatchDiscount2`\" "
+                   f"ISLIST=\"YES\" TYPE=\"Number\" INDEX=\"543\">\n"
+                   f"      <UDF:BATCHDISCOUNT2 DESC=\"`BatchDiscount2`\"> "
+                   f"{DISCOUNT_SECOND:g}</UDF:BATCHDISCOUNT2>\n"
+                   f"     </UDF:BATCHDISCOUNT2.LIST>\n"
                    if rate else "")
                 + f"     <AMOUNT>{b_amt}</AMOUNT>\n"
                 f"     <ACTUALQTY>{q}</ACTUALQTY>\n"
@@ -529,6 +540,19 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
             + f"    <AMOUNT>{line_amt:.2f}</AMOUNT>\n"
             f"    <ACTUALQTY>{lq}</ACTUALQTY>\n"
             f"    <BILLEDQTY>{lq}</BILLEDQTY>\n"
+            # Operator entries carry two per-line UDFs this build displays:
+            # the retailer ("Dealer Name" column) and the second discount.
+            # Shapes copied from a live SO/M3/220 export (2026-08-21).
+            + (f"    <UDF:VCHDEALERNAME.LIST DESC=\"`VChDealerName`\" "
+               f"ISLIST=\"YES\" TYPE=\"String\" INDEX=\"1003\">\n"
+               f"     <UDF:VCHDEALERNAME DESC=\"`VChDealerName`\">"
+               f"{esc(ln['dealer'])}</UDF:VCHDEALERNAME>\n"
+               f"    </UDF:VCHDEALERNAME.LIST>\n" if ln.get("dealer") else "")
+            + (f"    <UDF:EISPCLDIS.LIST DESC=\"`EISpclDis`\" "
+               f"ISLIST=\"YES\" TYPE=\"Number\" INDEX=\"544\">\n"
+               f"     <UDF:EISPCLDIS DESC=\"`EISpclDis`\"> "
+               f"{DISCOUNT_SECOND:g}</UDF:EISPCLDIS>\n"
+               f"    </UDF:EISPCLDIS.LIST>\n" if rate else "")
             + "\n".join(batches) + "\n"
             "    <ACCOUNTINGALLOCATIONS.LIST>\n"
             f"     <LEDGERNAME>{esc(ocfg.sales_ledger)}</LEDGERNAME>\n"
@@ -590,7 +614,9 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
            f"   <CONSIGNEESTATENAME>{esc(_state_from_gstin(party_gstin))}</CONSIGNEESTATENAME>\n"
            if _state_from_gstin(party_gstin) else "")
         + f"   <NARRATION>Queued from photographed order via Claude "
-        f"({esc(o['order_key'])}).</NARRATION>\n"
+        f"({esc(o['order_key'])})."
+        + (f" {esc(o['narration'])}" if o.get("narration") else "")
+        + "</NARRATION>\n"
         + "\n".join(inv) + "\n"
         "   <LEDGERENTRIES.LIST>\n"
         f"    <LEDGERNAME>{esc(o['party'])}</LEDGERNAME>\n"
