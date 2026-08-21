@@ -288,6 +288,24 @@ LEDGER_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
  <COUNTRYNAME>India</COUNTRYNAME>
  <GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>
  <MAILINGNAME>AMIT CORPORATION-SOLAPUR</MAILINGNAME>
+ <LEDMAILINGDETAILS.LIST>
+  <ADDRESS.LIST><ADDRESS>Old Market,</ADDRESS><ADDRESS>Solapur</ADDRESS></ADDRESS.LIST>
+  <APPLICABLEFROM>20240401</APPLICABLEFROM>
+ </LEDMAILINGDETAILS.LIST>
+ <LEDMAILINGDETAILS.LIST>
+  <ADDRESS.LIST><ADDRESS>Panjwani Market,</ADDRESS><ADDRESS>Solapur - 413006</ADDRESS></ADDRESS.LIST>
+  <APPLICABLEFROM>20250401</APPLICABLEFROM>
+ </LEDMAILINGDETAILS.LIST>
+</LEDGER>
+<LEDGER NAME="HISTORY ONLY-LEDGER">
+ <LEDMAILINGDETAILS.LIST>
+  <ADDRESS.LIST><ADDRESS>First Address</ADDRESS></ADDRESS.LIST>
+  <APPLICABLEFROM>20240401</APPLICABLEFROM>
+ </LEDMAILINGDETAILS.LIST>
+ <LEDMAILINGDETAILS.LIST>
+  <ADDRESS.LIST><ADDRESS>Latest Address</ADDRESS></ADDRESS.LIST>
+  <APPLICABLEFROM>20250401</APPLICABLEFROM>
+ </LEDMAILINGDETAILS.LIST>
 </LEDGER>
 </COLLECTION></DATA></BODY></ENVELOPE>"""
 
@@ -300,6 +318,19 @@ def test_ledger_extras():
     assert row["credit_period"] == ""      # '0' means none, not 'zero days'
     assert row["address"] == "Panjwani Market, Solapur - 413006"
     assert row["state"] == "Maharashtra"
+
+
+def test_address_is_read_once_from_the_live_list():
+    # A real export repeats the address inside every dated
+    # LEDMAILINGDETAILS.LIST; reading them all wrote each line twice into
+    # the voucher. The live top-level list wins.
+    row = parse_ledger_extras(LEDGER_XML)["AMIT CORPORATION-SOLAPUR"]
+    assert row["address_lines"] == ["Panjwani Market,", "Solapur - 413006"]
+
+
+def test_address_falls_back_to_the_latest_dated_block():
+    row = parse_ledger_extras(LEDGER_XML)["HISTORY ONLY-LEDGER"]
+    assert row["address_lines"] == ["Latest Address"]
 
 
 SIZES_XML = """<ENVELOPE><BODY><DATA><COLLECTION>

@@ -634,6 +634,27 @@ def ledger_extras_request(cfg: TallyConfig, as_on: date, start: date) -> str:
   </TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"""
 
 
+def _ledger_address(el) -> list[str]:
+    """
+    The party's CURRENT address, once.
+
+    A ledger export carries its address more than once: the live
+    ADDRESS.LIST at the top of the ledger, and again inside every
+    LEDMAILINGDETAILS.LIST — one dated block per time the mailing details
+    were edited. Collecting every ADDRESS in the element (what an .iter()
+    does) therefore returns the address two or more times over, and a
+    voucher built from that prints each line twice. The top-level list is
+    the live one; the dated blocks are history, latest last.
+    """
+    lst = el.find("ADDRESS.LIST")
+    if lst is None:
+        history = el.findall("LEDMAILINGDETAILS.LIST")
+        lst = history[-1].find("ADDRESS.LIST") if history else None
+    if lst is None:
+        return []
+    return [t for t in (_text(a) for a in lst.findall("ADDRESS")) if t]
+
+
 def parse_ledger_extras(raw: str) -> dict[str, dict]:
     """
     Per-ledger distributor fields, keyed by ledger name.
@@ -649,7 +670,7 @@ def parse_ledger_extras(raw: str) -> dict[str, dict]:
         # Kept both ways on purpose: the mirror wants one readable string,
         # while a voucher must reproduce the master's own line breaks — Tally
         # writes an ADDRESS.LIST of separate lines into every voucher.
-        address_lines = [t for t in (_text(a) for a in el.iter("ADDRESS")) if t]
+        address_lines = _ledger_address(el)
         address = " ".join(address_lines)
         credit_period = _text(el.find("BILLCREDITPERIOD"))
         out[name] = {
