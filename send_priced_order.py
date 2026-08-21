@@ -79,7 +79,7 @@ def main() -> int:
 
     gstin = ""
     from order_importer import _masters
-    parties, items, gstins = _masters(cfg, order["company"], {})
+    parties, items, gstins, details = _masters(cfg, order["company"], {})
     if order["party"] not in parties:
         print(f"Party {order['party']!r} is not a ledger in "
               f"{order['company']!r}", file=sys.stderr)
@@ -91,7 +91,7 @@ def main() -> int:
         return 2
     gstin = gstins.get(order["party"], "")
 
-    xml = build_envelope(order, ocfg, gstin)
+    xml = build_envelope(order, ocfg, gstin, party=details.get(order["party"]))
     total = sum(float(x) for x in __import__("re").findall(
         r"<ACCOUNTINGALLOCATIONS\.LIST>(?:(?!</ACCOUNTING).)*?"
         r"<AMOUNT>([^<]*)</AMOUNT>", xml, __import__("re").S))

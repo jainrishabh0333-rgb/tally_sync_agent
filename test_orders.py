@@ -25,6 +25,7 @@ from order_importer import (
     build_envelope,
     load_order_settings,
     normalise_order,
+    sales_ledger_for,
 )
 
 FAILED = 0
@@ -76,9 +77,20 @@ def queue_rows(rate=1740, unit="Box", second: dict | None = None) -> dict:
     }
 
 
-def envelope(raw: dict) -> str:
+# What _masters/fast_send hand over for one party: the ledger master's own
+# address lines, state, pincode and mailing name.
+MAHARASHTRA_PARTY = {
+    "address_lines": ["Shop 4, Cloth Market", "Aurangabad, Maharashtra, 431001"],
+    "state": "Maharashtra", "pincode": "431001",
+    "mailing_name": "SAMRAT HOSIERY", "gst_registration_type": "Regular",
+}
+UP_PARTY = dict(MAHARASHTRA_PARTY, state="Uttar Pradesh")
+
+
+def envelope(raw: dict, party: dict | None = MAHARASHTRA_PARTY,
+             gstin: str = "27AWRPS7219L1ZL") -> str:
     return build_envelope(normalise_order(raw), load_order_settings(),
-                          "27AWRPS7219L1ZL")
+                          gstin, False, party)
 
 
 print("queue shape")
@@ -126,6 +138,54 @@ check_raises(
     "any voucher type but Sales Order is refused",
     lambda: _assert_sales_order(xml.replace("Sales Order", "Journal")),
     exc=RuntimeError, contains="not exactly one")
+
+print("party address")
+addr_xml = envelope(queue_rows())
+check("the master's address lines are written, in order",
+      re.findall(r"<ADDRESS>([^<]*)</ADDRESS>", addr_xml),
+      MAHARASHTRA_PARTY["address_lines"])
+check("the buyer block carries the same lines",
+      re.findall(r"<BASICBUYERADDRESS>([^<]*)</BASICBUYERADDRESS>", addr_xml),
+      MAHARASHTRA_PARTY["address_lines"])
+check("mailing name comes from the master, not the ledger name",
+      re.findall(r"<PARTYMAILINGNAME>([^<]*)</PARTYMAILINGNAME>", addr_xml),
+      ["SAMRAT HOSIERY"])
+check("pincode is written for buyer and consignee",
+      re.findall(r"<(?:PARTY|CONSIGNEE)PINCODE>([^<]*)</(?:PARTY|CONSIGNEE)PINCODE>",
+                 addr_xml), ["431001", "431001"])
+check("state comes from the master",
+      re.findall(r"<STATENAME>([^<]*)</STATENAME>", addr_xml), ["Maharashtra"])
+no_addr = envelope(queue_rows(), party=None)
+check("a party with no details on file still builds (blank address)",
+      "<ADDRESS>" in no_addr, False)
+check("and falls back to the GSTIN prefix for its state",
+      re.findall(r"<STATENAME>([^<]*)</STATENAME>", no_addr), ["Maharashtra"])
+
+print("sales ledger follows the party's state")
+ocfg = load_order_settings()
+check("out-of-state party posts to the Central ledger",
+      sales_ledger_for({}, ocfg, "Maharashtra"), "Sale Central 5%")
+check("a party in the company's own state posts to Local",
+      sales_ledger_for({}, ocfg, "Uttar Pradesh"), "Sale Local 5%")
+check("state matching ignores case",
+      sales_ledger_for({}, ocfg, "uttar pradesh"), "Sale Local 5%")
+check("an unknown state falls back to Central",
+      sales_ledger_for({}, ocfg, ""), "Sale Central 5%")
+check("an explicit ledger on the order wins",
+      sales_ledger_for({"sales_ledger": "Sale Local 5%"}, ocfg, "Maharashtra"),
+      "Sale Local 5%")
+check("the envelope writes the Local ledger for a UP party",
+      set(re.findall(r"<LEDGERNAME>(Sale[^<]*)</LEDGERNAME>",
+                     envelope(queue_rows(), party=UP_PARTY,
+                              gstin="09ADWPK1913B1ZL"))),
+      {"Sale Local 5%"})
+check("and Central for an out-of-state one",
+      set(re.findall(r"<LEDGERNAME>(Sale[^<]*)</LEDGERNAME>", addr_xml)),
+      {"Sale Central 5%"})
+check("an unregistered UP party is still Local (master state, no GSTIN)",
+      set(re.findall(r"<LEDGERNAME>(Sale[^<]*)</LEDGERNAME>",
+                     envelope(queue_rows(), party=UP_PARTY, gstin=""))),
+      {"Sale Local 5%"})
 
 print("unpriced orders")
 check_raises(

@@ -23,26 +23,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import re as _re
 from tally_client import TallyConfig, TallyError, _post, fetch_ledgers, fetch_stock_items
 from order_importer import build_envelope, load_order_settings, normalise_order
-from distributor_fetch import fetch_sales_orders
+from distributor_fetch import fetch_ledger_extras, fetch_sales_orders
 from send_priced_order import build_order
 
 HERE = Path(__file__).resolve().parent
 CACHE = HERE / "masters_cache.json"
 
 
+# Per-party fields a voucher must carry itself — Tally fills in NONE of them
+# on import, so a cache without them produces addressless vouchers.
+_PARTY_FIELDS = ("address_lines", "state", "pincode", "mailing_name",
+                 "country", "gst_registration_type")
+
+
 def refresh_masters(cfg) -> dict:
     ledgers = fetch_ledgers(cfg)
     items = fetch_stock_items(cfg, date.today())
+    extras = fetch_ledger_extras(cfg, date.today(), date.today())
+    party_details = {
+        name: {k: v for k, v in row.items() if k in _PARTY_FIELDS and v}
+        for name, row in extras.items()
+    }
     data = {
         "company": cfg.company,
         "as_of": datetime.now().isoformat(timespec="seconds"),
         "parties": sorted(l.name for l in ledgers),
         "gstins": {l.name: (l.gstin or "").strip() for l in ledgers if l.gstin},
         "items": sorted(i.name for i in items),
+        "party_details": {k: v for k, v in party_details.items() if v},
     }
     CACHE.write_text(json.dumps(data, indent=1))
     print(f"masters cache: {len(data['parties'])} ledgers, "
-          f"{len(data['items'])} items -> {CACHE}")
+          f"{len(data['items'])} items, "
+          f"{len(data['party_details'])} party address blocks -> {CACHE}")
     return data
 
 
@@ -79,6 +92,13 @@ def main() -> int:
         print(f"Masters cache is {age_days}d old (max {a.max_cache_age}) or "
               f"wrong company. Run --refresh-masters.", file=sys.stderr)
         return 2
+    if "party_details" not in cache:
+        # Caches written before party details existed would send an
+        # addressless voucher to the wrong sales ledger — the exact pair of
+        # defects this guard was added for.
+        print("Masters cache predates party address details. Run "
+              "--refresh-masters before sending.", file=sys.stderr)
+        return 2
 
     hold = json.loads(a.hold.read_text())
     rates = json.loads(a.rates.read_text())
@@ -101,11 +121,20 @@ def main() -> int:
         return 2
 
     ocfg = load_order_settings(None)
-    xml = build_envelope(order, ocfg, cache["gstins"].get(order["party"], ""))
+    party_info = cache["party_details"].get(order["party"])
+    xml = build_envelope(order, ocfg, cache["gstins"].get(order["party"], ""),
+                         party=party_info)
     total = sum(float(x) for x in _re.findall(
         r"<ACCOUNTINGALLOCATIONS\.LIST>(?:(?!</ACCOUNTING).)*?"
         r"<AMOUNT>([^<]*)</AMOUNT>", xml, _re.S))
-    print(f"{len(order['lines'])} lines, order value {total:,.2f}")
+    ledgers = sorted(set(_re.findall(
+        r"<LEDGERNAME>(Sale[^<]*)</LEDGERNAME>", xml)))
+    print(f"{len(order['lines'])} lines, order value {total:,.2f}, "
+          f"sales ledger {'/'.join(ledgers)}, "
+          f"party state {(party_info or {}).get('state') or 'UNKNOWN'}")
+    if not (party_info or {}).get("address_lines"):
+        print(f"  WARNING: no address on file for {order['party']!r} — the "
+              f"voucher will show a blank party address.", file=sys.stderr)
     if a.dry_run:
         return 0
 

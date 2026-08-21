@@ -44,8 +44,9 @@ Usage
     python order_importer.py                       # one pass and exit
     python order_importer.py --company "NAME"      # only this company's orders
 Config: config.toml (same file as sync.py), optional [orders] section:
-    sales_ledger = "Sale Central 5%"   # accounting allocation on each line
-    poll         = false   # true = keep running, drain the queue every 60s
+    sales_ledger       = "Sale Central 5%"   # out-of-state (IGST) sales
+    sales_ledger_local = "Sale Local 5%"     # party in the company's own state
+    poll               = false  # true = keep running, drain the queue every 60s
 
 Expected order shape from Frappe (tally_bridge.api.pending_sales_orders):
     {"order_key": "...", "order_no": "...", "company": "...", "party": "...",
@@ -65,6 +66,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import distributor_fetch
 import sync
 from frappe_client import FrappeClient, FrappeError
 from tally_client import (
@@ -100,10 +102,12 @@ class OrderDataError(ValueError):
 
 @dataclasses.dataclass
 class OrderSettings:
-    # The zero-amount accounting allocation each order line carries — every
-    # operator-entered specimen names one. Staff correct it while pricing if
-    # a party needs the Local ledger instead.
-    sales_ledger: str = "Sale Central 5%"
+    # The accounting allocation each order line carries. WHICH of the two a
+    # line gets is decided per order from the party's state, not configured —
+    # see sales_ledger_for(). These name the pair; a book that renames its
+    # sales ledgers overrides them in [orders].
+    sales_ledger: str = "Sale Central 5%"        # inter-state (IGST)
+    sales_ledger_local: str = "Sale Local 5%"    # intra-state (CGST+SGST)
     # The company GST registration every voucher must bind to — this company
     # runs MULTIPLE registrations and every specimen names one. Constants
     # from the live specimens; override in [orders] if the company ever
@@ -123,6 +127,9 @@ def load_order_settings(path: Path | None = None) -> OrderSettings:
     return OrderSettings(
         sales_ledger=(str(o.get("sales_ledger", "Sale Central 5%")).strip()
                       or "Sale Central 5%"),
+        sales_ledger_local=(str(o.get("sales_ledger_local",
+                                      "Sale Local 5%")).strip()
+                            or "Sale Local 5%"),
         gst_registration=(str(o.get("gst_registration",
                                     "Uttar Pradesh Registration")).strip()
                           or "Uttar Pradesh Registration"),
@@ -293,6 +300,9 @@ def normalise_order(raw: dict) -> dict:
         "party": party,
         "order_date": order_date,
         "narration": str(raw.get("narration") or "").strip(),
+        # An explicit ledger on the order overrides the state rule — the
+        # escape hatch for the odd party whose treatment is not its address.
+        "sales_ledger": str(raw.get("sales_ledger") or "").strip(),
         "lines": lines,
     }
 
@@ -467,13 +477,73 @@ def _state_from_gstin(gstin: str) -> str:
     return _GST_STATES.get((gstin or "")[:2], "")
 
 
+def _home_state(ocfg: "OrderSettings") -> str:
+    """The state the company's own GST registration sits in (09 = UP)."""
+    return _state_from_gstin(ocfg.cmp_gstin)
+
+
+def party_state(party: "dict | None", party_gstin: str) -> str:
+    """
+    A party's state: the ledger master first, its GSTIN prefix as fallback.
+
+    The master is the better source because unregistered parties carry no
+    GSTIN at all — and in this book those are ordinary local retail accounts
+    (LOVE KUMAR, RAM MOHAN), exactly the ones a GSTIN-only rule misfiles.
+    """
+    return (str((party or {}).get("state") or "").strip()
+            or _state_from_gstin(party_gstin))
+
+
+def sales_ledger_for(o: dict, ocfg: "OrderSettings", state: str) -> str:
+    """
+    Local ledger for a party in the company's own state, Central otherwise.
+
+    Not a preference — the two ledgers are two tax treatments: intra-state
+    sales attract CGST+SGST, inter-state IGST. Verified against the live
+    book: every voucher on Sale Local 5% in 1-20 Aug 2026 is a UP party
+    (Agra, Kanpur, Varanasi, Aligarh, Etawah...), and this company is
+    registered in Uttar Pradesh. The importer previously wrote the Central
+    ledger on EVERY order, so UP parties were mis-stated (PR-MAHATMA and
+    UDR-GARG went in that way).
+
+    An order may still name its own ledger; an explicit choice wins.
+    """
+    override = str(o.get("sales_ledger") or "").strip()
+    if override:
+        return override
+    home = _home_state(ocfg)
+    if state and home and state.strip().lower() == home.lower():
+        return ocfg.sales_ledger_local
+    return ocfg.sales_ledger
+
+
+def _address_lists(party: "dict | None", esc) -> str:
+    """
+    The party address as Tally itself writes it into a voucher.
+
+    Every operator-entered specimen carries the master's address twice — once
+    as ADDRESS.LIST (the consignee/delivery block the order prints) and once
+    as BASICBUYERADDRESS.LIST (the buyer block) — with the master's own line
+    breaks preserved. Imports that omit them produce a voucher with a blank
+    party address, which is what the first ten imported orders look like.
+    """
+    lines = [str(a).strip() for a in (party or {}).get("address_lines") or []]
+    lines = [a for a in lines if a]
+    if not lines:
+        return ""
+    def block(tag: str) -> str:
+        inner = "\n".join(f"    <{tag}>{esc(a)}</{tag}>" for a in lines)
+        return f"   <{tag}.LIST TYPE=\"String\">\n{inner}\n   </{tag}.LIST>\n"
+    return block("ADDRESS") + block("BASICBUYERADDRESS")
+
+
 def _due_literal(d: "date") -> str:
     """Due dates as Tally itself writes them in orders: 1-Sep-26, 12-Aug-26."""
     return f"{d.day}-{d.strftime('%b-%y')}"
 
 
 def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
-                   optional: bool = False) -> str:
+                   optional: bool = False, party: "dict | None" = None) -> str:
     """
     Import envelope for ONE sales order, shaped to match how
     THIS Tally serialises operator-entered orders (22 live specimens,
@@ -487,6 +557,12 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
     - Each inventory line carries an ACCOUNTINGALLOCATIONS.LIST naming the
       sales ledger, and the voucher carries the party LEDGERENTRIES.LIST —
       both present in every specimen.
+    - The party's address, mailing name, pincode and state come from its
+      ledger master via `party` (see _masters) and are written the way the
+      specimens carry them. Without it Tally stores the voucher with a blank
+      party address; it does NOT look the master up on import.
+    - WHICH sales ledger a line gets follows the party's state — Local for
+      the company's own state, Central for the rest. See sales_ledger_for().
 
     A line carrying `rate` is priced: RATE/DISCOUNT on the line, BATCHRATE/
     BATCHDISCOUNT per size, amounts netted through the discount chain, and
@@ -496,6 +572,20 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
     """
     esc = _xml_escape
     d = _fmt_date(o["order_date"])
+    state = party_state(party, party_gstin)
+    sales_ledger = sales_ledger_for(o, ocfg, state)
+    if not state:
+        # Central is the safe-by-frequency guess, not a correct answer: it is
+        # right for ~87% of this book's parties and silently wrong for the
+        # rest, so it is said out loud rather than assumed.
+        log.warning("Order %s: no state on party %r (no ledger master detail "
+                    "and no GSTIN) — using %r; check it if the party is in %s.",
+                    o.get("order_key"), o.get("party"), sales_ledger,
+                    _home_state(ocfg) or "the company's own state")
+    if not (party or {}).get("address_lines"):
+        log.warning("Order %s: no address on file for %r — the voucher will "
+                    "carry a blank party address.",
+                    o.get("order_key"), o.get("party"))
 
     inv, grand = [], 0.0
     for ln in o["lines"]:
@@ -555,7 +645,7 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
                f"    </UDF:EISPCLDIS.LIST>\n" if rate else "")
             + "\n".join(batches) + "\n"
             "    <ACCOUNTINGALLOCATIONS.LIST>\n"
-            f"     <LEDGERNAME>{esc(ocfg.sales_ledger)}</LEDGERNAME>\n"
+            f"     <LEDGERNAME>{esc(sales_ledger)}</LEDGERNAME>\n"
             "     <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>\n"
             "     <LEDGERFROMITEM>No</LEDGERFROMITEM>\n"
             # The line every specimen carries and the first two imports left
@@ -582,7 +672,8 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
         "  <DATA><TALLYMESSAGE xmlns:UDF=\"TallyUDF\">\n"
         f"  <VOUCHER VCHTYPE=\"{ALLOWED_VCHTYPE}\" ACTION=\"Create\" "
         "OBJVIEW=\"Invoice Voucher View\">\n"
-        f"   <DATE>{d}</DATE>\n"
+        + _address_lists(party, esc)
+        + f"   <DATE>{d}</DATE>\n"
         f"   <VOUCHERTYPENAME>{ALLOWED_VCHTYPE}</VOUCHERTYPENAME>\n"
         f"   <VOUCHERNUMBER>{esc(o['order_no'])}</VOUCHERNUMBER>\n"
         f"   <REFERENCE>{esc(o['order_key'])}</REFERENCE>\n"
@@ -590,7 +681,26 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
         f"   <PARTYNAME>{esc(o['party'])}</PARTYNAME>\n"
         f"   <BASICBASEPARTYNAME>{esc(o['party'])}</BASICBASEPARTYNAME>\n"
         f"   <BASICBUYERNAME>{esc(o['party'])}</BASICBUYERNAME>\n"
-        "   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>\n"
+        # Mailing name, pincode and consignee block: the party's own master
+        # values, copied as an operator entry copies them. The consignee IS
+        # the buyer here — these orders are never shipped to a third address.
+        + f"   <PARTYMAILINGNAME>{esc((party or {}).get('mailing_name') or o['party'])}"
+        f"</PARTYMAILINGNAME>\n"
+        + f"   <CONSIGNEEMAILINGNAME>{esc((party or {}).get('mailing_name') or o['party'])}"
+        f"</CONSIGNEEMAILINGNAME>\n"
+        + (f"   <PARTYPINCODE>{esc((party or {}).get('pincode'))}</PARTYPINCODE>\n"
+           f"   <CONSIGNEEPINCODE>{esc((party or {}).get('pincode'))}</CONSIGNEEPINCODE>\n"
+           if (party or {}).get("pincode") else "")
+        + (f"   <CONSIGNEEGSTIN>{esc(party_gstin)}</CONSIGNEEGSTIN>\n"
+           if party_gstin else "")
+        + f"   <COUNTRYOFRESIDENCE>{esc((party or {}).get('country') or 'India')}"
+        f"</COUNTRYOFRESIDENCE>\n"
+        + f"   <CONSIGNEECOUNTRYNAME>{esc((party or {}).get('country') or 'India')}"
+        f"</CONSIGNEECOUNTRYNAME>\n"
+        + (f"   <GSTREGISTRATIONTYPE>{esc((party or {}).get('gst_registration_type'))}"
+           f"</GSTREGISTRATIONTYPE>\n"
+           if (party or {}).get("gst_registration_type") else "")
+        + "   <PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW>\n"
         # Present in EVERY operator-entered specimen and absent from the
         # first three attempts. This company runs multiple GST registrations
         # (tax units), and TallyPrime 3+ requires each voucher to bind to
@@ -609,10 +719,10 @@ def build_envelope(o: dict, ocfg: "OrderSettings", party_gstin: str,
         f"   <CMPGSTIN>{esc(ocfg.cmp_gstin)}</CMPGSTIN>\n"
         f"   <EFFECTIVEDATE>{d}</EFFECTIVEDATE>\n"
         + (f"   <PARTYGSTIN>{esc(party_gstin)}</PARTYGSTIN>\n" if party_gstin else "")
-        + (f"   <PLACEOFSUPPLY>{esc(_state_from_gstin(party_gstin))}</PLACEOFSUPPLY>\n"
-           f"   <STATENAME>{esc(_state_from_gstin(party_gstin))}</STATENAME>\n"
-           f"   <CONSIGNEESTATENAME>{esc(_state_from_gstin(party_gstin))}</CONSIGNEESTATENAME>\n"
-           if _state_from_gstin(party_gstin) else "")
+        + (f"   <PLACEOFSUPPLY>{esc(state)}</PLACEOFSUPPLY>\n"
+           f"   <STATENAME>{esc(state)}</STATENAME>\n"
+           f"   <CONSIGNEESTATENAME>{esc(state)}</CONSIGNEESTATENAME>\n"
+           if state else "")
         + f"   <NARRATION>Queued from photographed order via Claude "
         f"({esc(o['order_key'])})."
         + (f" {esc(o['narration'])}" if o.get("narration") else "")
@@ -671,16 +781,33 @@ def _company_open(cfg, company: str, cache: dict) -> bool:
 
 
 def _masters(cfg, company: str, cache: dict) -> tuple:
-    """(party names, item names, party->gstin) — fetched ONCE per run."""
+    """
+    (party names, item names, party->gstin, party->details) — ONCE per run.
+
+    The details are the ledger master's address, state, pincode and mailing
+    name: a voucher must carry them itself, since Tally does NOT fill them in
+    from the master on import, and the state decides which sales ledger the
+    order posts to.
+    """
     if company not in cache:
         cfg.company = company
         ledgers = fetch_ledgers(cfg)
         parties = {l.name for l in ledgers}
         gstins = {l.name: (l.gstin or "").strip() for l in ledgers}
         items = {i.name for i in fetch_stock_items(cfg, date.today())}
-        log.info("Cached masters for %r: %d ledgers, %d stock items.",
-                 company, len(parties), len(items))
-        cache[company] = (parties, items, gstins)
+        try:
+            details = distributor_fetch.fetch_ledger_extras(
+                cfg, date.today(), date.today())
+        except TallyError as exc:
+            # One extra request; if the build refuses it the orders still go
+            # in, minus the address, rather than stalling the queue.
+            log.warning("Party master details unavailable for %r (%s) — "
+                        "vouchers will carry no party address.", company, exc)
+            details = {}
+        log.info("Cached masters for %r: %d ledgers, %d stock items, "
+                 "%d with address details.",
+                 company, len(parties), len(items), len(details))
+        cache[company] = (parties, items, gstins, details)
     return cache[company]
 
 
@@ -812,11 +939,13 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             # Build and PRINT, send nothing, change no status. Validation
             # still runs when Tally is reachable so the first real order can
             # be eyeballed together with what would happen to it.
-            party_gstin = ""
+            party_gstin, party_info = "", None
             if _company_open(cfg, o["company"], open_cache):
                 try:
-                    parties, items, gstins = _masters(cfg, o["company"], masters_cache)
+                    parties, items, gstins, details = _masters(
+                        cfg, o["company"], masters_cache)
                     party_gstin = gstins.get(o["party"], "")
+                    party_info = details.get(o["party"])
                     err = validate_masters(o, parties, items)
                     if err:
                         log.warning("Order %s WOULD FAIL: %s", key, err)
@@ -829,7 +958,8 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
                     skipped += 1
             else:
                 skipped += 1
-            xml = build_envelope(o, ocfg, party_gstin, args.optional)
+            xml = build_envelope(o, ocfg, party_gstin, args.optional,
+                                 party_info)
             print(f"--- DRY RUN — {key} ({o['company']}) ---")
             print(xml)
             print()
@@ -842,21 +972,26 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             continue
 
         try:
-            parties, items, gstins = _masters(cfg, o["company"], masters_cache)
+            parties, items, gstins, details = _masters(
+                cfg, o["company"], masters_cache)
         except TallyError as exc:
             log.warning("Order %s: cannot read masters for %r (%s) — leaving "
                         "it Pending.", key, o["company"], exc)
             skipped += 1
             continue
 
-        # The configured sales ledger is a name going into the import too —
-        # subject to the same auto-create hazard as party and items. A miss
-        # is a CONFIG error, not an order error: leave the order Pending and
-        # tell the operator to fix config.toml.
-        if ocfg.sales_ledger not in parties:
-            log.error("Order %s left Pending — [orders].sales_ledger %r does "
-                      "not exist as a ledger in %r. Fix config.toml.",
-                      key, ocfg.sales_ledger, o["company"])
+        # The sales ledger is a name going into the import too — subject to
+        # the same auto-create hazard as party and items. Check the one this
+        # order will actually use (Local or Central, per the party's state).
+        # A miss is a CONFIG error, not an order error: leave the order
+        # Pending and tell the operator to fix config.toml.
+        party_info = details.get(o["party"])
+        chosen_ledger = sales_ledger_for(
+            o, ocfg, party_state(party_info, gstins.get(o["party"], "")))
+        if chosen_ledger not in parties:
+            log.error("Order %s left Pending — sales ledger %r does not exist "
+                      "as a ledger in %r. Fix [orders] in config.toml.",
+                      key, chosen_ledger, o["company"])
             skipped += 1
             continue
 
@@ -867,7 +1002,8 @@ def run_pass(st: sync.Settings, ocfg: OrderSettings, fc: FrappeClient,
             failed += 1
             continue
 
-        xml = build_envelope(o, ocfg, gstins.get(o["party"], ""), args.optional)
+        xml = build_envelope(o, ocfg, gstins.get(o["party"], ""),
+                             args.optional, party_info)
         outcome = import_order(fc, cfg, o, xml)
         imported += outcome == "imported"
         failed += outcome == "failed"
