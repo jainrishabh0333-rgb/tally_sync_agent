@@ -107,11 +107,16 @@ def _post(cfg: TallyConfig, xml_body: str, *, attempts: int = 4) -> str:
         except requests.RequestException as exc:
             _last_request_at = time.monotonic()
             if attempt == attempts:
+                # The chunk_days hint only makes sense for a retried READ.
+                # post_write() sends attempts=1 and appends its own, very
+                # different instruction: verify before resending.
+                hint = ("" if attempts == 1 else
+                        " Tally answers on this port but stops accepting "
+                        "connections while it digests a large export — if this "
+                        "persists, reduce sync.chunk_days.")
                 raise TallyError(
                     f"Could not reach Tally at {cfg.url} after {attempts} "
-                    f"attempts. Tally answers on this port but stops accepting "
-                    f"connections while it digests a large export — if this "
-                    f"persists, reduce sync.chunk_days. ({exc})"
+                    f"attempt(s).{hint} ({exc})"
                 ) from exc
             log.warning("Tally did not answer (attempt %d/%d: %s) — "
                         "waiting %.0fs and trying again.", attempt, attempts,
@@ -134,6 +139,32 @@ def _post(cfg: TallyConfig, xml_body: str, *, attempts: int = 4) -> str:
         end = text.find("</LINEERROR>", start)
         raise TallyError(f"Tally line error: {text[start:end].strip()}")
     return text
+
+
+def post_write(cfg: TallyConfig, xml_body: str) -> str:
+    """Send an IMPORT envelope. NEVER retried — use this for every write.
+
+    `_post` retries 4x on any RequestException, which is correct for reads and
+    dangerous for writes. A ReadTimeout does not mean Tally rejected the
+    envelope; it means the answer did not come back in time. Tally may already
+    have committed the voucher, so a replay creates a SECOND one under the same
+    voucher number — up to four. That is how PR-MAHATMA came to exist three
+    times in the live book on 2026-08-21. Reads are idempotent; imports are not.
+
+    A line error is re-raised untouched: Tally answered and refused, so nothing
+    was written and the caller can report a clean failure. A transport failure
+    is re-raised with the only safe instruction — VERIFY, do not resend blind.
+    """
+    try:
+        return _post(cfg, xml_body, attempts=1)
+    except TallyError as exc:
+        if "Could not reach Tally" not in str(exc):
+            raise                    # Tally answered and rejected it.
+        raise TallyError(
+            f"Write to Tally did not complete, and was NOT retried on purpose: "
+            f"{exc} The voucher MAY already have been committed — count that "
+            f"voucher number on its own date in Tally before resending."
+        ) from exc
 
 
 # Characters XML 1.0 forbids outright: C0 controls except tab/newline/CR,

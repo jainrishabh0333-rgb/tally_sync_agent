@@ -37,7 +37,7 @@ import sys
 from pathlib import Path
 
 from sync import load_settings
-from tally_client import TallyConfig, TallyError, _post, assert_company_loaded
+from tally_client import TallyConfig, TallyError, post_write, assert_company_loaded
 
 HERE = Path(__file__).resolve().parent
 COMPANY = "SN JAIN INDUSTRIES PVT LTD - (26-27)"
@@ -187,7 +187,7 @@ def main() -> int:
             continue
         print(f"\n--- {label} ---")
         try:
-            resp = _post(cfg, xml, attempts=1)
+            resp = post_write(cfg, xml)
             v = _verdict(resp)
         except TallyError as exc:
             v = f"transport/line error: {str(exc)[:80]}"

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import sync
 from order_importer import build_envelope, load_order_settings, normalise_order
-from tally_client import TallyError, _post
+from tally_client import TallyError, post_write
 
 
 def build_order(hold: dict, rates: dict) -> tuple[dict, list[str]]:
@@ -110,7 +110,7 @@ def main() -> int:
     out.mkdir(exist_ok=True)
     (out / f"sent-{order['order_key']}-{stamp}.xml").write_text(xml)
     try:
-        resp = _post(cfg, xml)
+        resp = post_write(cfg, xml)
     except TallyError as exc:
         print(f"SEND FAILED (may or may not have imported): {exc}",
               file=sys.stderr)
