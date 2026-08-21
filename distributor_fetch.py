@@ -646,8 +646,11 @@ def parse_ledger_extras(raw: str) -> dict[str, dict]:
         name = el.get("NAME") or _text(el.find("NAME"))
         if not name:
             continue
-        address = " ".join(
-            t for t in (_text(a) for a in el.iter("ADDRESS")) if t)
+        # Kept both ways on purpose: the mirror wants one readable string,
+        # while a voucher must reproduce the master's own line breaks — Tally
+        # writes an ADDRESS.LIST of separate lines into every voucher.
+        address_lines = [t for t in (_text(a) for a in el.iter("ADDRESS")) if t]
+        address = " ".join(address_lines)
         credit_period = _text(el.find("BILLCREDITPERIOD"))
         out[name] = {
             "credit_limit": abs(_to_float(_text(el.find("CREDITLIMIT")))),
@@ -660,6 +663,7 @@ def parse_ledger_extras(raw: str) -> dict[str, dict]:
             "gst_registration_type": _text(el.find("GSTREGISTRATIONTYPE")),
             "mailing_name": _text(el.find("MAILINGNAME")),
             "address": address,
+            "address_lines": address_lines,
         }
     return out
 

@@ -66,6 +66,12 @@ godown = "Any"
 # request per cycle. Example, should the book ever add one:
 # delivery_types = ["Delivery Note"]
 delivery_types = []
+# The two sales ledgers an order line can post to. Which one a given order
+# gets is decided per order from the party's state — Local when the party is
+# in the company's own registration state (CGST+SGST), Central otherwise
+# (IGST). Only set these if the book renames its sales ledgers.
+# sales_ledger       = "Sale Central 5%"
+# sales_ledger_local = "Sale Local 5%"
 # false = one pass and exit (run it by hand or from Task Scheduler).
 # true  = keep running and drain the queue every 60 seconds.
 poll = false

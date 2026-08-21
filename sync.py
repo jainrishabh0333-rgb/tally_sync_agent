@@ -506,6 +506,9 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     payload = [dataclasses.asdict(l) for l in ledgers]
     for row in payload:
         row.update(extras.get(row["name"], {}))
+        # address_lines exists for the order importer (a voucher reproduces
+        # the master's line breaks); the mirror keeps the flat `address`.
+        row.pop("address_lines", None)
         # The agent (salesperson) is the immediate group under Sundry
         # Debtors in this book — "AGENT RK" and the like. No ledger UDF
         # carries it (inspected 2026-08-15: the export shows no UDF tags on
