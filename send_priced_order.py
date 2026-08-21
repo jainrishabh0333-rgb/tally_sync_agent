@@ -41,13 +41,15 @@ def build_order(hold: dict, rates: dict) -> tuple[dict, list[str]]:
                  [{"size": l["item"].rsplit("-(", 1)[0].rsplit(" ", 1)[-1],
                    "qty": l["qty"]}])
         lines.append({"item": l["item"], "unit": l["unit"],
-                      "rate": rate_num, "sizes": sizes})
+                      "rate": rate_num, "dealer": l.get("dealer", ""),
+                      "sizes": sizes})
     return {
         "order_key": hold.get("order_key") or f"PAD-{hold['order_no']}",
         "order_no": hold["order_no"],
         "company": hold["company"],
         "party": hold["party"],
         "order_date": hold["order_date"],
+        "narration": hold.get("narration", ""),
         "items": lines,
     }, missing
 
