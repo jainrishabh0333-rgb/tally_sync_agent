@@ -25,3 +25,8 @@ resp-*.xml
 # Rate master — current trade rates for every item; business data, keep local
 rates_master.json
 masters_cache.json
+
+# Rendered dispatch-readiness pages. They name parties, order numbers and
+# shortfalls — internal only, and this repo is public. The renderer and its
+# template are tracked; their output never is.
+out/
