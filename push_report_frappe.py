@@ -6,16 +6,28 @@ cannot open them, which keeps the MD's internal-only rule. Title is stable
 so the same Note updates in place every morning.
 
     python3 push_report_frappe.py "/path/to/latest.txt"
+    python3 push_report_frappe.py "/path/to/latest.txt" report.json
+
+With the structured report as a second argument the Note leads with summary
+tables — headline figure, readiness bands, cutting priority, the parties with
+the most orders — and carries the full text below. Without it the Note is the
+plain monospace dump, as before.
+
+Only `content` is ever sent. The Note's `public` flag is left exactly as it
+is on the site: it is 0 there, and this report must not become 0-flag public
+by accident.
 """
-import html, sys
+import html, json, sys
 from pathlib import Path
 import requests
+from readiness_html import note_html
 
 ENV = Path("/Users/rishabhsmac/FRAPPE/mcp_server/.env")
 TITLE = "DISPATCH READINESS (auto)"
 
 def main():
     text = Path(sys.argv[1]).read_text()
+    report = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 else None
     vals = {}
     for line in ENV.read_text().splitlines():
         if "=" in line and not line.strip().startswith("#"):
@@ -23,7 +35,8 @@ def main():
     url = vals["FRAPPE_URL"].rstrip("/")
     H = {"Authorization":
          f"token {vals['FRAPPE_API_KEY']}:{vals['FRAPPE_API_SECRET']}"}
-    body = ("<div style='font-family:monospace;white-space:pre;"
+    body = (note_html(report, text) if report else
+            "<div style='font-family:monospace;white-space:pre;"
             "font-size:12px'>" + html.escape(text) + "</div>")
     q = requests.get(f"{url}/api/resource/Note",
                      params={"filters": f'[["title","=","{TITLE}"]]',

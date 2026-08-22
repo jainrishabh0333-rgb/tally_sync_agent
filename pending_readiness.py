@@ -12,13 +12,14 @@ takes stock before later orders see it — so two orders never count the
 same dozen. INTERNAL ONLY: this report never goes to the portal
 (party-facing rule).
 """
-import argparse, sys
+import argparse, json, sys
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tally_client import TallyConfig
 from distributor_fetch import fetch_sales_orders, fetch_invoices, harvest_size_balances
+from readiness_html import render as render_html
 
 
 def main():
@@ -27,7 +28,12 @@ def main():
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--company", default="SN JAIN INDUSTRIES PVT LTD - (26-27)")
     ap.add_argument("--days", type=int, default=45)
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="write the text report here")
+    ap.add_argument("--html", type=Path, default=None,
+                    help="also write the browsable dashboard here")
+    ap.add_argument("--json", type=Path, default=None,
+                    help="also write the structured report here")
     a = ap.parse_args()
 
     cfg = TallyConfig(host=a.host, port=a.port, timeout=280)
@@ -120,18 +126,51 @@ def main():
                          sorted(d["sizes"].items(), key=lambda x: -x[1]))
         W(f"  blocks {len(d['orders']):3d} orders  short {d['qty']:8g}   {item}")
         W(f"        {sizes}")
+    by_u = defaultdict(lambda: {"qty": 0.0, "orders": set()})
+    for (item, size), rec in blocked_unknown.items():
+        by_u[item]["qty"] += rec["qty"]; by_u[item]["orders"] |= rec["orders"]
     if blocked_unknown:
         W("\nNO RECENT STOCK SIGHTING (excluded from percentages — count "
           "them by hand or move the item once, and BlncQty will report it):")
-        by_u = defaultdict(lambda: {"qty": 0.0, "orders": set()})
-        for (item, size), rec in blocked_unknown.items():
-            by_u[item]["qty"] += rec["qty"]; by_u[item]["orders"] |= rec["orders"]
         for item, d in sorted(by_u.items(), key=lambda x: -len(x[1]["orders"]))[:40]:
             W(f"  {len(d['orders']):3d} orders  qty {d['qty']:8g}   {item}")
     text = "\n".join(lines_out) + "\n"
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
         a.out.write_text(text)
+
+    if a.html or a.json:
+        # The text report truncates its two tail sections for readability; the
+        # structured report does not, because the page has a search box and
+        # nothing there has to be cut to fit.
+        report = {
+            "company": a.company,
+            "as_of": f"{today:%d-%b-%Y}",
+            "window_from": f"{frm:%d-%b}",
+            "order_count": len(rank),
+            "orders": [{
+                "voucher": v["voucher_number"], "date": str(v["date"]),
+                "party": v["party"], "got": got, "need": need,
+                "unknown": unknown, "pct": pct, "ready": pct >= 99.95,
+                "shorts": [{"item": i, "qty": q} for i, q in
+                           sorted(shorts.items(), key=lambda x: -x[1])],
+            } for pct, v, got, need, unknown, shorts in rank],
+            "blocking": [{
+                "item": item, "orders": len(d["orders"]), "qty": d["qty"],
+                "sizes": d["sizes"],
+            } for item, d in sorted(by_item.items(),
+                                    key=lambda x: -len(x[1]["orders"]))],
+            "unknown": [{
+                "item": item, "orders": len(d["orders"]), "qty": d["qty"],
+            } for item, d in sorted(by_u.items(),
+                                    key=lambda x: -len(x[1]["orders"]))],
+        }
+        for path, body in ((a.json, lambda: json.dumps(report, indent=1)),
+                           (a.html, lambda: render_html(report))):
+            if path:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body())
+                print(f"wrote {path}")
     print(text)
 
 
