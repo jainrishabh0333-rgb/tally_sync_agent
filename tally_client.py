@@ -34,6 +34,19 @@ class TallyError(RuntimeError):
     """Raised when Tally is unreachable or returns an error envelope."""
 
 
+class TallyUnreachable(TallyError):
+    """Nothing was listening on the Tally port — the process is not up.
+
+    Kept separate from every other TallyError because it is not a fault in
+    this agent, in the request, or in the data: Tally is simply closed. On a
+    hosted box that is the normal state outside working hours, and a scheduled
+    run that reports it as a FAILURE buries the real failures under hundreds of
+    rows a week. A read TIMEOUT is deliberately NOT this class — that means
+    Tally answered the socket and then could not keep up, which is the cadence
+    problem worth shouting about.
+    """
+
+
 @dataclass
 class TallyConfig:
     host: str = "localhost"
@@ -107,14 +120,30 @@ def _post(cfg: TallyConfig, xml_body: str, *, attempts: int = 4) -> str:
         except requests.RequestException as exc:
             _last_request_at = time.monotonic()
             if attempt == attempts:
-                # The chunk_days hint only makes sense for a retried READ.
-                # post_write() sends attempts=1 and appends its own, very
-                # different instruction: verify before resending.
-                hint = ("" if attempts == 1 else
-                        " Tally answers on this port but stops accepting "
-                        "connections while it digests a large export — if this "
-                        "persists, reduce sync.chunk_days.")
-                raise TallyError(
+                # The hint only makes sense for a retried READ. post_write()
+                # sends attempts=1 and appends its own, very different
+                # instruction: verify before resending.
+                #
+                # Two different hints, because the two causes have opposite
+                # fixes and the old single hint blamed chunk_days for what was
+                # really a closed Tally — which cost a day of diagnosis.
+                refused = (isinstance(exc, requests.ConnectionError)
+                           and not isinstance(exc, requests.Timeout))
+                if attempts == 1:
+                    hint = ""
+                elif refused:
+                    hint = (" Nothing is listening on that port, so Tally is "
+                            "not running — check whether it is open on the "
+                            "server. This is expected outside working hours.")
+                else:
+                    hint = (" Tally answers on this port but stops accepting "
+                            "connections while it digests a large export — if "
+                            "this persists, reduce sync.chunk_days.")
+                # Refused means the port is closed, i.e. Tally is not
+                # running; a timeout means it IS running and could not keep
+                # up. Different problems, different classes, different fixes.
+                cls = TallyUnreachable if refused else TallyError
+                raise cls(
                     f"Could not reach Tally at {cfg.url} after {attempts} "
                     f"attempt(s).{hint} ({exc})"
                 ) from exc

@@ -33,6 +33,7 @@ from frappe_client import FrappeClient, FrappeConfig, FrappeError
 from tally_client import (
     TallyConfig,
     TallyError,
+    TallyUnreachable,
     _parse_credit_days,
     _tally_date_to_iso,
     fetch_bills,
@@ -832,6 +833,7 @@ def main() -> int:
 
     totals = {"ledgers": 0, "vouchers": 0, "bills": 0, "items": 0}
     failed: list = []
+    skipped: list = []
 
     for company in companies:
         # Each company is its own Tally export scope.
@@ -854,6 +856,22 @@ def main() -> int:
                 counts["range"] = f"{frm}..{to}"
                 if not args.no_distributor:
                     counts["distributor"] = sync_distributor_docs(st, fc, frm, to)
+        except TallyUnreachable as exc:
+            # Tally is not running. On this hosted box that is the normal
+            # state outside working hours, and it is not a fault: nothing was
+            # attempted, nothing was half-written, and the next run will pick
+            # the window up unchanged. Logging it as Failed put ~340 rows a
+            # week into the failure list and hid the failures that mattered —
+            # so it is recorded as Skipped, which sync_health counts apart.
+            #
+            # Still recorded, never swallowed: a mirror that stops advancing
+            # because Tally has been closed for two days must be visible.
+            log.warning("Tally not running, skipping %s: %s", company, exc)
+            counts["error"] = str(exc)
+            counts["seconds"] = round((datetime.now() - c_started).total_seconds(), 1)
+            fc.log_sync("Skipped", counts)
+            skipped.append(company)
+            continue
         except (TallyError, FrappeError, ValueError) as exc:
             # One bad company must not abort the rest.
             log.error("Sync failed for %s: %s", company, exc)
@@ -878,7 +896,13 @@ def main() -> int:
              elapsed, totals["ledgers"], totals.get("bills", 0),
              totals.get("items", 0), totals["vouchers"], len(companies),
              "y" if len(companies) == 1 else "ies",
-             f" ({len(failed)} failed: {', '.join(failed)})" if failed else "")
+             (f" ({len(failed)} failed: {', '.join(failed)})" if failed else "")
+             + (f" ({len(skipped)} skipped, Tally not running: "
+                f"{', '.join(skipped)})" if skipped else ""))
+    # Skipped is deliberately NOT a non-zero exit. The Windows task treats a
+    # non-zero code as a failed run, and a closed Tally overnight is not a
+    # failed run — making it one would turn the task's own history into the
+    # same noise this change removes from the Frappe log.
     return 1 if failed else 0
 
 
