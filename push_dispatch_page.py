@@ -79,7 +79,20 @@ def main():
             "payload_json": json.dumps(report, separators=(",", ":")),
         })
     if not r.ok:
-        sys.exit(f"{r.status_code}: {r.text[:800]}")
+        # The two failures this actually hits, both fixable in a minute, and
+        # both easy to misread from a wall of traceback JSON.
+        blob = r.text[:1500]
+        if "No module named" in blob:
+            sys.exit("The site does not have tally_bridge.dispatch_readiness "
+                     "yet.\nOn Frappe Cloud the SITE update only applies an "
+                     "already-built bench: update the APP on the bench and "
+                     "Deploy first, then update the site.")
+        if "PermissionError" in blob or r.status_code == 403:
+            sys.exit("Permission refused. The uploading user needs the "
+                     "'Dispatch Readiness Publisher' role — assign it on the "
+                     "User record in Desk. Everything else it does is "
+                     "read-only, which is why it is not a System Manager.")
+        sys.exit(f"{r.status_code}: {blob}")
     msg = r.json().get("message", {})
     print(f"{msg.get('action', 'stored')} {msg.get('name')} — "
           f"{url}/app/dispatch-readiness")
