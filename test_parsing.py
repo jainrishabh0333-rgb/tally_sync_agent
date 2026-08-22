@@ -7,6 +7,7 @@ Tally instance. Run:  python test_parsing.py
 
 from __future__ import annotations
 
+import pathlib
 import sys
 import xml.etree.ElementTree as ET
 from datetime import date
@@ -299,6 +300,66 @@ for argv in ([], ["--check"], ["--full"], ["--ledgers-only"], ["--vouchers-only"
         check_true(f"parses {' '.join(argv) or '(no args)'}", False, "argparse rejected it")
     except AttributeError as exc:
         check_true(f"parses {' '.join(argv) or '(no args)'}", False, str(exc))
+
+# ---------------------------------------------------------------------------
+# A closed Tally is not a failed sync
+#
+# The scheduled run fires every 15 minutes; Tally on the hosted box is only
+# open during working hours. Reporting each of those runs as Failed put ~340
+# rows a week into the failure list and hid the failures that mattered. The
+# distinction is drawn on the EXCEPTION TYPE, so it is pinned here: refused
+# means the port is closed (Tally is not running), timed out means Tally
+# answered and could not keep up — opposite causes, opposite fixes.
+# ---------------------------------------------------------------------------
+
+import requests as _requests
+from unittest import mock as _mock
+
+from tally_client import TallyUnreachable, _post
+
+_cfg = TallyConfig(host="localhost", port=9000, timeout=1)
+
+
+def _raise_on_post(exc):
+    """Run _post with requests.post always raising `exc`; return what came out."""
+    with _mock.patch("tally_client.requests.post", side_effect=exc), \
+         _mock.patch("tally_client.time.sleep"):          # no real backoff
+        try:
+            _post(_cfg, "<ENVELOPE/>", attempts=2)
+        except TallyError as caught:
+            return caught
+    return None
+
+
+_refused = _raise_on_post(
+    _requests.ConnectionError("[WinError 10061] actively refused it"))
+check_true("connection refused raises TallyUnreachable",
+           isinstance(_refused, TallyUnreachable))
+check_true("refusal names the real cause, not chunk_days",
+           "not running" in str(_refused)
+           and "chunk_days" not in str(_refused),
+           str(_refused))
+
+_timeout = _raise_on_post(_requests.ReadTimeout("timed out"))
+check_true("read timeout stays a plain TallyError",
+           isinstance(_timeout, TallyError)
+           and not isinstance(_timeout, TallyUnreachable))
+check_true("timeout keeps the chunk_days hint",
+           "chunk_days" in str(_timeout), str(_timeout))
+
+# ConnectTimeout subclasses BOTH ConnectionError and Timeout. It means Tally
+# never answered the handshake in time, not that the port is closed, so it
+# must NOT be treated as "Tally is not running".
+_conn_timeout = _raise_on_post(_requests.ConnectTimeout("connect timed out"))
+check_true("connect timeout is not mistaken for a closed port",
+           not isinstance(_conn_timeout, TallyUnreachable))
+
+# The sync loop must record it as Skipped, not Failed — that is the whole
+# point, and it is one string away from silently reverting.
+_src = (pathlib.Path(__file__).with_name("sync.py")).read_text()
+check_true("sync.py logs an unreachable Tally as Skipped",
+           'except TallyUnreachable' in _src
+           and 'fc.log_sync("Skipped", counts)' in _src)
 
 print()
 if failures:
