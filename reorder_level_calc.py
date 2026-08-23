@@ -280,10 +280,28 @@ def collect(cfg: TallyConfig, frm: date, to: date, types: list,
     to one timeout matters. Each chunk's raw XML is written as it arrives and
     re-read on a later run, which makes the job resumable and makes a reparse
     free.
+
+    NEVER read this cache by globbing it. A file is keyed by its exact date
+    range, so changing --chunk-days leaves the OLD chunking in place beside
+    the new one and both cover the same days. This function is safe because it
+    reads only the filenames its own date_chunks() produces; anything that
+    globs `mv_*.xml` double-counts every overlapping day. Measured 2026-08-23:
+    43 files for a 90-day window (a 3-day and a 7-day chunking), and a script
+    that globbed them reported exactly twice the real dispatch -- a number
+    wrong by a clean factor, which is the kind that reads as plausible.
     """
     rf.STOCK_VOUCHER_TYPES = types
     moves = []
     chunks = list(date_chunks(frm, to, chunk_days))
+    if cache_dir and os.path.isdir(cache_dir):
+        wanted = {f"mv_{a}_{b}.xml" for a, b in chunks}
+        stale = [f for f in os.listdir(cache_dir)
+                 if f.startswith("mv_") and f not in wanted]
+        if stale:
+            log.warning("%d cached chunk(s) in %s are from a DIFFERENT "
+                        "--chunk-days and are ignored here. They overlap these "
+                        "dates: do not glob this directory.",
+                        len(stale), cache_dir)
     for i, (a, b) in enumerate(chunks, 1):
         path = os.path.join(cache_dir, f"mv_{a}_{b}.xml") if cache_dir else ""
         raw = ""
