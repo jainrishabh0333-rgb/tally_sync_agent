@@ -69,6 +69,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+try:  # Python 3.11+ has tomllib; fall back to tomli if present.
+    import tomllib  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    try:
+        import tomli as tomllib  # type: ignore
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore
+
 import reorder_fetch as rf
 from frappe_client import FrappeClient, FrappeConfig
 from tally_client import TallyConfig, _post
@@ -301,13 +309,45 @@ def collect(cfg: TallyConfig, frm: date, to: date, types: list,
 # Frappe side
 # ---------------------------------------------------------------------------
 
-def frappe_from_env() -> FrappeConfig | None:
-    url = os.environ.get("FRAPPE_URL", "")
-    key = os.environ.get("FRAPPE_API_KEY", "")
-    sec = os.environ.get("FRAPPE_API_SECRET", "")
+def _config_toml() -> dict:
+    """
+    config.toml beside this file, or {} — never an exit.
+
+    Read directly rather than through sync.load_settings(), which validates
+    the whole sync configuration and sys.exit()s on anything missing. This
+    script has to run in two places with different halves of that config
+    present: the Mac reaches Tally over Tailscale and carries Frappe keys in
+    the environment with no config.toml at all, while the Tally box has the
+    file and nothing in the environment. Borrowing the strict loader would
+    make each of them fail on the other's missing half.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "config.toml")
+    if not os.path.exists(path) or tomllib is None:
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except (OSError, ValueError) as exc:
+        # A permission error here is expected on the Tally box, where
+        # config.toml is owned by an account whose ACL excludes it. Say so
+        # instead of falling through to "keys not set", which sends the
+        # reader looking for a config problem that does not exist.
+        log.warning("Could not read config.toml (%s) — falling back to the "
+                    "environment.", exc)
+        return {}
+
+
+def frappe_config(cfg_toml: dict | None = None) -> FrappeConfig | None:
+    """Frappe credentials from the environment, else from config.toml."""
+    f = (cfg_toml or {}).get("frappe", {})
+    url = os.environ.get("FRAPPE_URL", "") or f.get("url", "")
+    key = os.environ.get("FRAPPE_API_KEY", "") or f.get("api_key", "")
+    sec = os.environ.get("FRAPPE_API_SECRET", "") or f.get("api_secret", "")
     if not (url and key and sec):
         return None
-    return FrappeConfig(url=url.rstrip("/"), api_key=key, api_secret=sec)
+    return FrappeConfig(url=str(url).rstrip("/"), api_key=str(key),
+                        api_secret=str(sec))
 
 
 def _get_list(fc: FrappeClient, doctype: str, fields: list,
@@ -397,9 +437,9 @@ def summarise(rows: list[dict], window_days: int, days_cover: int) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default=os.environ.get("TALLY_HOST", "localhost"))
-    ap.add_argument("--port", type=int, default=9000)
-    ap.add_argument("--company", default=os.environ.get("TALLY_COMPANY", ""))
+    ap.add_argument("--host", default="")
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--company", default="")
     ap.add_argument("--window", type=int, default=90,
                     help="days of dispatch history to measure (default 90)")
     ap.add_argument("--days-cover", type=int, default=45,
@@ -422,16 +462,25 @@ def main(argv=None) -> int:
     to = date.fromisoformat(a.to) if a.to else date.today()
     frm = to - timedelta(days=a.window - 1)
 
-    cfg = TallyConfig(host=a.host, port=a.port, company=a.company, timeout=280)
+    conf = _config_toml()
+    t = conf.get("tally", {})
+    cfg = TallyConfig(
+        host=a.host or os.environ.get("TALLY_HOST") or t.get("host", "localhost"),
+        port=a.port or int(os.environ.get("TALLY_PORT") or t.get("port", 9000)),
+        company=(a.company or os.environ.get("TALLY_COMPANY")
+                 or t.get("company") or (t.get("companies") or [""])[0]),
+        timeout=280,
+    )
+    log.info("Tally %s:%s company=%r", cfg.host, cfg.port, cfg.company)
     types = TRADE_TYPES + OTHER_OUTWARD_TYPES
     moves = collect(cfg, frm, to, types, a.chunk_days, a.cache)
     demand = demand_from_movements(moves)
 
     rows = propose(demand, a.window, a.days_cover, a.round, a.demand)
 
-    fcfg = frappe_from_env()
+    fcfg = frappe_config(conf)
     if fcfg is None:
-        log.error("FRAPPE_URL / FRAPPE_API_KEY / FRAPPE_API_SECRET not set — "
+        log.error("No Frappe credentials in the environment or config.toml — "
                   "cannot read current levels; writing demand only.")
         rows = merge_current(rows, {}, {}, {})
     else:
