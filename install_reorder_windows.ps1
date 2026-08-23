@@ -147,8 +147,16 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 $action    = New-ScheduledTaskAction -Execute $cmdPath
 $trigger   = New-ScheduledTaskTrigger -Daily -At $AtTime
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+# RestartCount/RestartInterval matter more than they look. Frappe Cloud
+# restarts its workers routinely, so a run can meet a genuine HTTP 503 —
+# observed 2026-08-23. frappe_client retries over 2+4+8 seconds and gives up,
+# which is right for the 15-minute sync (the next run is minutes away) and
+# wrong for a once-a-day job, where losing the attempt means a day of stale
+# numbers. Retrying at the SCHEDULER level fixes it here without lengthening
+# backoffs for every other job that shares that HTTP client.
 $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-                -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+                -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings `
