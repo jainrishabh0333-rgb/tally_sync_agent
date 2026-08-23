@@ -159,11 +159,21 @@ Write-Host "Scheduled command: $python $scriptArg"
 # folder, so refreshing that folder from GitHub can no longer delete the one
 # thing the scheduled task points at. The task still RUNS from $here -- sync.py
 # and config.toml live there -- it just is not launched from there.
+#
+# Four: self-update. The wrapper refreshes the agent folder from GitHub before
+# each run, so shipping a fix is a push and nothing else -- no ZIP download, no
+# copying folders onto C: by hand. self_update.ps1 compiles the new code before
+# it swaps it in and never deletes, and its exit code is ignored here on
+# purpose: a failed update must leave the installed version running, not stop
+# the mirror. Older installs have no self_update.ps1, hence the existence test.
 $cmdPath = Join-Path $TaskDir "run_sync.cmd"
 $outPath = Join-Path $TaskDir "task_out.txt"
+$updPath = Join-Path $here "self_update.ps1"
+$updOut  = Join-Path $TaskDir "update_out.txt"
 @"
 @echo off
 cd /d "$here"
+if exist "$updPath" powershell -NoProfile -ExecutionPolicy Bypass -File "$updPath" > "$updOut" 2>&1
 "$python" $scriptArg > "$outPath" 2>&1
 exit /b %ERRORLEVEL%
 "@ | Set-Content -Path $cmdPath -Encoding ASCII
