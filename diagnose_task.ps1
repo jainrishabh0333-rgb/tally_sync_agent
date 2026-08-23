@@ -88,6 +88,63 @@ if (Test-Path $cmdNew) {
     Write-Host "    -> the task fires at a file that is not there and exits 1 before any Python runs. This is the classic silent death. Re-run install_windows.ps1."
 }
 
+Section "2b. Is the self-updater actually wired in?"
+# The wrapper runs the updater behind `if exist`, so a missing self_update.ps1
+# is not an error -- it is SILENCE. And because the updater is the only thing
+# that would ever deliver self_update.ps1, a box installed before that file
+# existed can never bootstrap it: every push lands on GitHub and nothing
+# reaches C:\tally_bridge, forever, while the sync keeps reporting Success.
+# deploy.py cannot see this either; it only checks that the sync task fired.
+# Measured 2026-08-23: exactly this, with no update.log on the box at all.
+$upd    = Join-Path $here "self_update.ps1"
+$updOut = Join-Path $TaskDir "update_out.txt"
+$updLog = Join-Path $TaskDir "update.log"
+$verPath = Join-Path $here "VERSION.txt"
+
+if (Test-Path $upd) { Good "self_update.ps1 is present" }
+else {
+    Bad "self_update.ps1 is NOT in $here."
+    Write-Host "    -> the wrapper skips it silently and no push will ever land here."
+    Write-Host "    FIX: Invoke-WebRequest 'https://raw.githubusercontent.com/jainrishabh0333-rgb/tally_sync_agent/main/self_update.ps1' -OutFile '$upd' -UseBasicParsing"
+}
+
+$cmdLive = if (Test-Path $cmdNew) { $cmdNew } elseif (Test-Path $cmdOld) { $cmdOld } else { $null }
+if ($cmdLive) {
+    if ((Get-Content $cmdLive -Raw) -match "self_update") { Good "run_sync.cmd calls the updater" }
+    else {
+        Bad "run_sync.cmd does NOT mention self_update."
+        Write-Host "    -> this wrapper predates self-updating and will never refresh the folder."
+        Write-Host "    FIX: re-run install_windows.ps1 to regenerate it."
+    }
+}
+
+if (Test-Path $updLog) {
+    Write-Host "  update.log last written $((Get-Item $updLog).LastWriteTime)"
+    Get-Content $updLog -Tail 10 | ForEach-Object { Write-Host "    $_" }
+} elseif (Test-Path $updOut) {
+    Write-Host "  no update.log, but update_out.txt exists -- the updater started and died early:"
+    Get-Content $updOut -Tail 20 | ForEach-Object { Write-Host "    $_" }
+} else {
+    Bad "neither update.log nor update_out.txt exists -- the updater has NEVER run."
+}
+
+# Installed commit vs GitHub head. The whole point of the updater is that
+# these match; when they do not, say by how much rather than just 'stale'.
+if (Test-Path $verPath) {
+    $local = (Get-Content $verPath -Raw).Trim()
+    Write-Host "  VERSION.txt: $local"
+    try {
+        $head = (Invoke-RestMethod -Uri "https://api.github.com/repos/jainrishabh0333-rgb/tally_sync_agent/commits/main" `
+                 -Headers @{ "User-Agent" = "tally-bridge-diagnose" } -TimeoutSec 20).sha
+        if ($local -eq $head) { Good "up to date with GitHub main" }
+        else { Bad "GitHub main is $head -- the installed copy is BEHIND." }
+    } catch {
+        Write-Host "    (could not reach the GitHub API: $($_.Exception.Message))"
+    }
+} else {
+    Write-Host "  no VERSION.txt -- consistent with an updater that has never run."
+}
+
 Section "3. Can SYSTEM (not you) import requests?"
 # The task runs as SYSTEM. A per-user pip install is invisible to SYSTEM, and
 # pip will still say "already satisfied" to an admin. -s disables user
