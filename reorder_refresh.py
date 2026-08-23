@@ -14,10 +14,22 @@ This job refreshes the four and leaves the fifth alone.
 BASELINE + DELTA, not a full rebuild
 ------------------------------------
 Deriving stock from scratch means replaying every inventory voucher of the
-financial year — hundreds of megabytes, and slow. Unnecessary here: the export
-already carries in-stock / unpack / stitching AS AT ITS EXPORT TIME. So the
-stored row is the baseline and this job applies only the movements since, which
-is a few days of data.
+financial year. Measured 2026-08-23: 359 MB and ~15 minutes of a SHARED LIVE
+production Tally, on an idle Sunday, with per-chunk times varying 9x purely
+from other users' load. Unnecessary here anyway: the export already carries
+in-stock / unpack / stitching AS AT ITS EXPORT TIME. So the stored row is the
+baseline and this job applies only the movements since, which is a few days.
+
+UNITS: DO NOT NORMALISE
+-----------------------
+All 15 units in this book are SIMPLE — Conversion 0.0, no BaseUnits — so no
+Box-to-Doz factor exists. Quantities are summed in each item's own unit, which
+is also the unit the report states that row in. An earlier version converted
+everything to Doz, got None back from an empty conversion table, and silently
+DISCARDED the movement; 956 of 1,093 rows are Box-based, so it would have
+thrown away most of every day's movement. Beware the item NAMES: 982 of 1,093
+carry "-(Doz)" in the name while being Box-unit items. The name is not the
+unit.
 
 The consequence worth understanding: accuracy is anchored to the last export.
 Re-exporting a group re-baselines it and clears any accumulated drift, and that
@@ -46,7 +58,7 @@ import logging
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from tally_client import TallyConfig, _conversion_to, fetch_units
+from tally_client import TallyConfig, fetch_units
 from reorder_fetch import (
     BUCKET_STITCHING,
     BUCKET_STOCK,
@@ -113,13 +125,25 @@ def baseline_date(rows: list[dict]) -> date | None:
 # Applying movements
 # ---------------------------------------------------------------------------
 
-def movement_deltas(cfg: TallyConfig, frm: date, to: date) -> dict:
+def collect_movements(cfg: TallyConfig, frm: date, to: date) -> list:
     """
-    {(item, size): {bucket: qty}} of movement since the baseline.
+    Every size-bearing stock movement in the window, in its own unit.
 
-    Quantities are normalised to Doz, the unit the report is stated in.
-    Anything that cannot be converted is dropped and counted rather than
-    added raw — mixing Box and Doz into one figure would be silently wrong.
+    NO UNIT CONVERSION. This looked wrong and is not: measured 2026-08-23,
+    all 15 units in this book are SIMPLE — Conversion 0.0, no BaseUnits — so
+    no Box-to-Doz factor exists to apply, and every item's movements arrive in
+    that item's own unit. The report states each row in its item's unit too,
+    which is why its deficit identity holds on 1,093/1,093 rows.
+
+    An earlier version normalised everything to Doz. `_conversion_to` returned
+    None for Box, Pcs and Kgs — because the table it needs is empty — and the
+    movement was DISCARDED behind a warning count. 956 of 1,093 report rows
+    are Box-based, so that would have thrown away most of every day's
+    movement and quietly under-reported stock. It never fired only because it
+    was scheduled on a day with nothing to apply.
+
+    Mixed units within one (item, size) would make a raw sum wrong, so that is
+    checked and reported loudly rather than assumed away.
     """
     # An empty window is the normal state on the day the levels were exported:
     # the baseline is today, so the first day to apply is tomorrow. Asking
@@ -129,49 +153,88 @@ def movement_deltas(cfg: TallyConfig, frm: date, to: date) -> dict:
     # 7am. Say plainly that there is nothing to apply instead.
     if frm > to:
         log.info("Baseline is current as of %s — no movements to apply.", to)
-        return {}
+        return []
 
     units = {u.name: u for u in fetch_units(cfg)}
     parents = fetch_godown_parents(cfg)
-    moves = fetch_movements(cfg, frm, to, units, parents)
+    moves = [m for m in fetch_movements(cfg, frm, to, units, parents)
+             if m.size_batch]
 
-    deltas: dict = defaultdict(lambda: defaultdict(float))
-    unconvertible = 0
+    seen_units: dict = defaultdict(set)
     for m in moves:
-        if not m.size_batch:
-            continue
-        if m.unit == "Doz":
-            factor = 1.0
-        else:
-            factor = _conversion_to(m.unit, "Doz", units)
-            if factor is None:
-                back = _conversion_to("Doz", m.unit, units)
-                factor = (1.0 / back) if back else None
-        if factor is None:
-            unconvertible += 1
-            continue
-        deltas[(m.item_name, m.size_batch)][m.bucket] += m.qty * factor
+        if m.unit:
+            seen_units[(m.item_name, m.size_batch)].add(m.unit)
+    mixed = {k: sorted(u) for k, u in seen_units.items() if len(u) > 1}
+    if mixed:
+        # Never silently sum across units. If this ever fires, the assumption
+        # above has broken and the figures for those pairs are not safe.
+        log.error("%d item/size pairs carry MIXED units — their totals are "
+                  "NOT trustworthy: %s", len(mixed), list(mixed.items())[:5])
 
-    if unconvertible:
-        log.warning("%d movements skipped: no conversion to Doz", unconvertible)
-    log.info("Applied %d movements across %d item/size pairs",
-             len(moves), len(deltas))
+    log.info("Collected %d movements across %d item/size pairs",
+             len(moves), len(seen_units))
+    return moves
+
+
+def deltas_after(moves: list, after: date) -> dict:
+    """
+    {(item, size): {bucket: qty}} from movements strictly AFTER a given date.
+
+    Rows carry their own `as_of`, so each is brought forward from its own
+    baseline rather than from a single global one. A group re-exported today
+    sits beside a group last exported a week ago, and applying one shared
+    window to both would re-apply a week of movement to the fresh group.
+    """
+    cutoff = after.isoformat()
+    deltas: dict = defaultdict(lambda: defaultdict(float))
+    for m in moves:
+        if m.date and m.date > cutoff:
+            deltas[(m.item_name, m.size_batch)][m.bucket] += m.qty
     return deltas
 
 
-def refreshed_rows(baseline: list[dict], deltas: dict,
-                   pending: dict | None = None) -> list[dict]:
+def _row_as_of(row: dict) -> date | None:
+    raw = row.get("as_of")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw)).date()
+    except ValueError:
+        return None
+
+
+def refreshed_rows(baseline: list[dict], moves: list,
+                   pending: dict | None = None,
+                   default_as_of: date | None = None) -> list[dict]:
     """
     Baseline plus delta, with the deficit recomputed.
+
+    Each row is brought forward from ITS OWN `as_of`, not from a single global
+    baseline. That is what makes it safe to stamp `as_of` only on the rows
+    that actually changed: an untouched row keeps its older baseline, so the
+    next run re-derives it from the same point rather than double-applying.
+    Stamping the whole table instead would mean 1,093 writes a day to record
+    a watermark.
+
+    Movements are pre-aggregated once per distinct baseline date — in practice
+    one or two — rather than per row.
 
     WIP (pressing / packing) is folded into stitching, matching how the report
     presents pipeline stock: goods part-made are not sellable but must not be
     re-cut either.
     """
+    cutoffs = {(_row_as_of(r) or default_as_of) for r in baseline}
+    cutoffs.discard(None)
+    by_cutoff = {c: deltas_after(moves, c) for c in cutoffs}
+    if len(by_cutoff) > 1:
+        log.info("Rows carry %d distinct baselines: %s", len(by_cutoff),
+                 sorted(str(c) for c in by_cutoff))
+
     out = []
     for row in baseline:
         key = (row["item_name"], str(row["size"]))
-        d = deltas.get(key) or {}
+        cut = _row_as_of(row) or default_as_of
+        d = (by_cutoff.get(cut) or {}).get(key) or {}
         in_stock = (row["in_stock"] or 0.0) + d.get(BUCKET_STOCK, 0.0)
         unpack = (row["unpack_qty"] or 0.0) + d.get(BUCKET_UNPACK, 0.0)
         stitching = ((row["stitching"] or 0.0)
@@ -275,8 +338,10 @@ def refresh(cfg: TallyConfig, fc, groups=None, max_age_days: int = 45,
         )
     log.info("Baseline %s, refreshing to %s (%d days)", frm, to, age)
 
-    deltas = movement_deltas(cfg, frm + timedelta(days=1), to)
-    rows = refreshed_rows(baseline, deltas)
+    # Fetched ONCE over the widest window any row needs, then sliced per row
+    # by that row's own baseline. One Tally pull, correct per-row arithmetic.
+    moves = collect_movements(cfg, frm + timedelta(days=1), to)
+    rows = refreshed_rows(baseline, moves, default_as_of=frm)
     write_back(fc, rows, dry_run=dry_run)
     return rows
 
