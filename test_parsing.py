@@ -361,6 +361,49 @@ check_true("sync.py logs an unreachable Tally as Skipped",
            'except TallyUnreachable' in _src
            and 'fc.log_sync("Skipped", counts)' in _src)
 
+
+# --- the agent reports which commit it is running -------------------------
+# deploy.py used to infer "the update is installed" from the sync task having
+# fired. It proves nothing: the wrapper runs self_update.ps1 behind `if exist`
+# and ignores its exit code, so a box without that file skips the update in
+# silence forever. The commit now rides every sync-log row instead.
+
+import tempfile as _tf
+from frappe_client import FrappeClient, FrappeConfig, _read_commit, agent_commit
+
+_d = _tf.mkdtemp()
+_v = pathlib.Path(_d) / "VERSION.txt"
+
+check("no VERSION.txt reads as empty, not as a crash", _read_commit(str(_v)), "")
+
+_v.write_text("tally_sync_agent\ncommit c6d4924abc123\nfetched 2026-08-23\n")
+check("commit parsed off its own line", _read_commit(str(_v)), "c6d4924abc123")
+
+_v.write_text("no commit line here at all\n")
+check("a VERSION.txt without a commit line reads as empty",
+      _read_commit(str(_v)), "")
+
+
+class _Capture(FrappeClient):
+    """Records the payload instead of sending it."""
+    def __init__(self):
+        self.sent = None
+
+    def _call(self, method, path, **kw):
+        self.sent = (path, kw.get("json"))
+        return {}
+
+
+_cap = _Capture()
+_counts = {"ledgers": 3}
+_cap.log_sync("Skipped", _counts)
+check_true("every sync-log row carries agent_commit",
+           "agent_commit" in (_cap.sent[1] or {}).get("detail", {}),
+           f"got {_cap.sent}")
+check("the caller's counts dict is not mutated", _counts, {"ledgers": 3})
+check("agent_commit is a string even with no VERSION.txt",
+      isinstance(agent_commit(), str), True)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S)")

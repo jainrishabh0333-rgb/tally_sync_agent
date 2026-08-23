@@ -11,6 +11,7 @@ inbound firewall rules needed.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,47 @@ from typing import Any
 import requests
 
 log = logging.getLogger("frappe")
+
+_agent_commit: str | None = None
+
+
+def agent_commit(path: str = "") -> str:
+    """
+    The commit self_update.ps1 installed, read from VERSION.txt beside this
+    file. "" when there is no VERSION.txt -- which is itself the useful
+    answer: it means the self-updater has never run here.
+
+    This exists so a deploy can be VERIFIED rather than assumed. deploy.py
+    used to conclude "the update is installed" from the sync task having
+    fired, which proves only that the task fired: the wrapper runs the
+    updater behind `if exist` and ignores its exit code on purpose, so a box
+    with no self_update.ps1 skips it in silence and reports Success forever.
+    Measured 2026-08-23 -- two pushes confirmed installed, neither one there.
+
+    Stamped in log_sync() rather than at its call sites so it rides EVERY
+    status. Failed and Skipped rows matter most: a stale agent is exactly
+    what mislabels closed-hours skips as failures, and that is the moment
+    someone needs to know which code produced the row.
+    """
+    if path:
+        return _read_commit(path)
+    global _agent_commit
+    if _agent_commit is None:
+        _agent_commit = _read_commit(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "VERSION.txt"))
+    return _agent_commit
+
+
+def _read_commit(path: str) -> str:
+    """The `commit <sha>` line of a VERSION.txt, or "" if unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("commit "):
+                    return line.split(None, 1)[1].strip()
+    except OSError:
+        pass
+    return ""
 
 
 class FrappeError(RuntimeError):
@@ -161,6 +203,9 @@ class FrappeClient:
         )
 
     def log_sync(self, status: str, detail: dict[str, Any]) -> None:
+        # Copied, not mutated: the caller's dict is its own running tally of
+        # counts and is reused after this returns.
+        detail = {**detail, "agent_commit": agent_commit()}
         try:
             self._call(
                 "POST",
