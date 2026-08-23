@@ -121,6 +121,16 @@ def movement_deltas(cfg: TallyConfig, frm: date, to: date) -> dict:
     Anything that cannot be converted is dropped and counted rather than
     added raw — mixing Box and Doz into one figure would be silently wrong.
     """
+    # An empty window is the normal state on the day the levels were exported:
+    # the baseline is today, so the first day to apply is tomorrow. Asking
+    # Tally for "tomorrow to today" returns nothing anyway, but it costs three
+    # requests and writes a date range that reads backwards in the log —
+    # which is exactly the sort of line that sends someone hunting a bug at
+    # 7am. Say plainly that there is nothing to apply instead.
+    if frm > to:
+        log.info("Baseline is current as of %s — no movements to apply.", to)
+        return {}
+
     units = {u.name: u for u in fetch_units(cfg)}
     parents = fetch_godown_parents(cfg)
     moves = fetch_movements(cfg, frm, to, units, parents)
