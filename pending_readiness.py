@@ -57,10 +57,20 @@ def main():
 
     orders = []
     for v in sorted(sos, key=lambda x: x["date"]):
-        # operators retire orders by renaming them "...(CANCEL)" rather than
-        # cancelling the voucher — both spellings mean not pending
+        # Three ways an order stops being real demand, and all three must be
+        # checked. Only the first two were:
+        #
+        #  * cancelled in Tally (IsCancelled)
+        #  * retired by RENAMING it "...(CANCEL)" / "(close)", which is what
+        #    the operators here actually do — 90 of 644 in a 45-day window
+        #  * marked OPTIONAL, i.e. entered but not posted. Tally excludes
+        #    optional vouchers from its own books, and they were being counted
+        #    here as live demand. That let drafts and our own test vouchers
+        #    (PR-MAHATMA, CLTEST-P1, SO/R8/test) into the report as orders to
+        #    cut goods for.
         vn = v["voucher_number"].upper()
-        if v.get("is_cancelled") or "CANCEL" in vn or "CLOSE" in vn:
+        if (v.get("is_cancelled") or v.get("is_optional")
+                or "CANCEL" in vn or "CLOSE" in vn):
             continue
         pend = []
         for l in v["lines"]:
