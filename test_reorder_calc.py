@@ -109,3 +109,20 @@ def test_unsized_lines_are_dropped_rather_than_pooled_under_one_blank_size():
     would invent a phantom size carrying every unsized sale."""
     d = C.demand_from_movements([mv("Sales", "A", "", -10)])
     assert d == {}
+
+
+def test_config_toml_survives_what_notepad_writes():
+    """The Tally box's config.toml is edited in Notepad, which saves a UTF-8
+    BOM by default. Handing those bytes straight to tomllib fails with
+    'Invalid statement (at line 1, column 1)' — an error that names a line
+    with nothing visibly wrong on it. Measured on the box 2026-08-23.
+
+    The decoder is asserted directly rather than through tomllib, which this
+    workspace's Python 3.9 does not carry; the Tally box runs 3.14 and does.
+    """
+    body = '[frappe]\nurl = "https://x.test"\n'
+    for raw in (body.encode("utf-8"),                        # plain
+                b"\xef\xbb\xbf" + body.encode("utf-8"),      # Notepad UTF-8+BOM
+                body.encode("utf-16"),                       # Notepad "Unicode"
+                body.replace("\n", "\r\n").encode("utf-8")):  # CRLF
+        assert C._decode_toml(raw) == body, raw[:4]

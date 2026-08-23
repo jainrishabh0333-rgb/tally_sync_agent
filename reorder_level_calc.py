@@ -309,6 +309,31 @@ def collect(cfg: TallyConfig, frm: date, to: date, types: list,
 # Frappe side
 # ---------------------------------------------------------------------------
 
+def _decode_toml(raw: bytes) -> str:
+    """
+    Decode config.toml the way sync.py does, because Notepad wrote it.
+
+    `tomllib.load()` on the raw handle is WRONG here and fails with
+    "Invalid statement (at line 1, column 1)" — measured on the Tally box
+    2026-08-23. That file is edited in Notepad on Windows, which saves a
+    UTF-8 BOM by default and offers "Unicode" (UTF-16) and "ANSI" (cp1252)
+    besides. The BOM lands as an invisible character before the first
+    section header, so the error names line 1 and points at nothing visible.
+
+    sync.py has always handled this; this function was written later and did
+    not, so the agent read its own config on the Mac (no file at all) and
+    failed on the one machine that has it.
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):   # UTF-16, "Unicode" in Notepad
+        text = raw.decode("utf-16")
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252", errors="replace")   # Notepad "ANSI"
+    return text.replace("\r\n", "\n").lstrip("\ufeff")
+
+
 def _config_toml() -> dict:
     """
     config.toml beside this file, or {} — never an exit.
@@ -327,7 +352,8 @@ def _config_toml() -> dict:
         return {}
     try:
         with open(path, "rb") as fh:
-            return tomllib.load(fh)
+            raw = fh.read()
+        return tomllib.loads(_decode_toml(raw))
     except (OSError, ValueError) as exc:
         # A permission error here is expected on the Tally box, where
         # config.toml is owned by an account whose ACL excludes it. Say so
