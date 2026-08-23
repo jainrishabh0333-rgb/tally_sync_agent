@@ -155,6 +155,9 @@ table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
   margin-right:6px;vertical-align:0}
 .exp{cursor:pointer}
 .exp .car{color:var(--muted);font-size:10px;margin-left:5px}
+.pdfl{color:inherit;text-decoration:none;border-bottom:1px dotted var(--muted)}
+.pdfl:hover{border-bottom-style:solid}
+@media print{.pdfl{border-bottom:0}}
 .old{color:var(--critical);font-weight:600}
 
 /* ---------- distribution ---------- */
@@ -577,6 +580,20 @@ function drawOrders(){
 // under a party group they join the group's tbody, so `nested` swaps the
 // party name (already in the group header) for the shortfall summary.
 function orderRows(o, sn, nested){
+// The voucher number doubles as the link to that order's PDF on Frappe.
+// D.site is empty when the report is rendered without a site, and then this
+// is plain text — an archived page opened from disk must not grow dead links.
+// stopPropagation because the row's own click expands the shortfall list, and
+// a click meant for the link should not do both.
+function vno(o){
+  if(!D.site) return esc(o.voucher);
+  const u = D.site + '/api/method/tally_bridge.dispatch_readiness.order_pdf?voucher='
+          + encodeURIComponent(o.voucher);
+  return '<a class="pdfl" href="' + esc(u) + '" target="_blank" rel="noopener"'
+       + ' title="Open this order as a PDF" onclick="event.stopPropagation()">'
+       + esc(o.voucher) + '</a>';
+}
+
   const tone = toneOf(o.pct);
   const tr = el('tr', (o.shorts.length ? 'exp ' : '') + (nested ? 'sub' : ''));
   const mid = nested
@@ -587,7 +604,7 @@ function orderRows(o, sn, nested){
     : '<td class="nm grow">'+esc(o.party)+'</td>';
   tr.innerHTML =
      '<td class="sn hide">'+(nested ? '' : sn)+'</td>'
-    +'<td class="vno'+(nested?' ind':'')+'">'+esc(o.voucher)
+    +'<td class="vno'+(nested?' ind':'')+'">'+vno(o)
       +(o.shorts.length?'<span class="car">▾</span>':'')+'</td>'
     +'<td class="hide mu dte">'+esc(dmy(o.date))+'</td>'
     + mid

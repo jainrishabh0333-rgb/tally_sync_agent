@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -227,10 +228,17 @@ def _company(name: str) -> str:
     return _FY_SUFFIX.sub("", name).strip() or COMPANY
 
 
-def render(report: dict) -> str:
+# Where the order PDFs live. Each voucher number in the report links to
+# `order_pdf` on this site; set SNJ_SITE to point a render somewhere else, or
+# to "" to render the report with no links at all.
+SITE = os.environ.get("SNJ_SITE", "https://snjpr.nvi.frappe.cloud").rstrip("/")
+
+
+def render(report: dict, site: str | None = None) -> str:
     """Structured report dict -> one self-contained HTML page."""
     summary = _summarise(report)
     payload = {
+        "site": (SITE if site is None else site.rstrip("/")),
         "company": _company(report.get("company") or COMPANY),
         "as_of": report.get("as_of", ""),
         "window_from": report.get("window_from", ""),

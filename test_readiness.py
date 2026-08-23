@@ -103,8 +103,34 @@ def test_sizes_and_ages():
 
 
 def test_render_is_self_contained():
+    """Nothing is FETCHED from the network — fonts, scripts, styles, images.
+
+    This used to assert that the string "https://" appeared nowhere, which was
+    a fair proxy until the voucher numbers became links to the order PDFs on
+    Frappe. A link is not a fetch: the page still renders with no network at
+    all, and only navigates if someone clicks. So the check now names the
+    constructs that actually reach out, and the link is tested separately for
+    being the ONLY outbound URL.
+    """
     html = R.render(parsed())
     assert "__DATA__" not in html and "__ASOF__" not in html
     assert "21-Aug-2026" in html
-    for bad in ("http://", "https://", "//cdn"):
-        assert bad not in html, f"page reaches out to {bad}"
+    for bad in ("<script src", "<link ", "@import", "url(http", "srcset",
+                "fetch(", "XMLHttpRequest", "//cdn", "<img"):
+        assert bad not in html, f"page reaches out via {bad}"
+
+
+def test_only_outbound_url_is_the_pdf_link():
+    """Every http(s) in the page belongs to the order-PDF link, and no other."""
+    import re
+    html = R.render(parsed(), site="https://example.test")
+    urls = set(re.findall(r"https?://[^\s\"'<>]+", html))
+    assert urls == {"https://example.test"}, urls
+    assert "order_pdf?voucher=" in html
+
+
+def test_render_without_a_site_has_no_links_at_all():
+    """An archived page rendered with no site must not grow dead links."""
+    html = R.render(parsed(), site="")
+    assert '"site":""' in html
+    assert "https://" not in html and "http://" not in html
