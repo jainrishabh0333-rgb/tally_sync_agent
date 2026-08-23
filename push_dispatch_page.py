@@ -94,6 +94,31 @@ def main():
                      "read-only, which is why it is not a System Manager.")
         sys.exit(f"{r.status_code}: {blob}")
     msg = r.json().get("message", {})
+
+    # Read it back and check the report SURVIVED the round trip.
+    #
+    # Frappe HTML-sanitises text fields on save. It silently turned <script>
+    # into &lt;script&gt; and dropped the doctype and the aria/placeholder
+    # attributes, so the page uploaded "successfully" and then rendered its own
+    # JavaScript as visible text. Nothing in the response said so — the store
+    # call returned a clean 200. The doctype now sets ignore_xss_filter, and
+    # this check exists so that if it is ever lost again the push says so
+    # instead of the report quietly turning into a wall of source code.
+    check = requests.get(
+        f"{url}/api/method/tally_bridge.dispatch_readiness.get_snapshot",
+        headers=H, params={"name": msg.get("name") or ""}, timeout=180)
+    if check.ok:
+        back = (check.json().get("message") or {}).get("page_html") or ""
+        if "&lt;script&gt;" in back or ("<script" in page and "<script" not in back):
+            sys.exit(
+                "Uploaded, but the site MANGLED it: the report's <script> came "
+                "back escaped, so the page will show its source instead of "
+                "running.\nThe doctype field needs ignore_xss_filter — deploy "
+                "the current tally_bridge and push again.")
+        if len(back) < len(page) - 64:
+            print(f"  warning: stored {len(back)} chars of {len(page)} — "
+                  f"something was stripped on save.")
+
     print(f"{msg.get('action', 'stored')} {msg.get('name')} — "
           f"{url}/app/dispatch-readiness")
 
