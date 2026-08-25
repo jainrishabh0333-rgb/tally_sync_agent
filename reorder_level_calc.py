@@ -99,6 +99,15 @@ FINISHED_GROUPS = ["Panty", "Bra", "Camisol", "Cycling Short", "Bloomer"]
 # against trade dispatch would credit a return to a channel that never sold.
 TRADE_TYPES = ["Sales", "Credit Note"]
 
+# Tally's placeholder batch name, used when an item is billed without a batch.
+# It is NOT a size, and a level proposed against it is a level against
+# nothing: measured 2026-08-23, `PANTY (PCS)` carried one of 2,029 — the
+# single largest row in the sheet — while three sibling rows netted NEGATIVE
+# dispatch. Dropped from proposals, but counted and logged, because for most
+# items it is entirely correct: fabric, raw material and packing stock are not
+# size-tracked and have no batch to give.
+UNSIZED_BATCHES = {"primary batch"}
+
 # Everything else that takes finished goods out of the factory. Measured in
 # its own column whichever mode is chosen, so the cost of excluding it is
 # visible on the sheet rather than left to be discovered later.
@@ -122,14 +131,44 @@ class Demand:
     unit: str
     trade_qty: float = 0.0      # Sales less Credit Note
     other_qty: float = 0.0      # marketplace / V-Mart / branch challans
+    trade_wqty: float = 0.0     # the same, each line scaled by its day's weight
+    other_wqty: float = 0.0
     units_seen: frozenset = frozenset()
 
     @property
     def all_qty(self) -> float:
         return self.trade_qty + self.other_qty
 
+    @property
+    def all_wqty(self) -> float:
+        return self.trade_wqty + self.other_wqty
 
-def demand_from_movements(moves: list) -> dict:
+
+def day_weights(frm: date, to: date, half_life: int) -> dict:
+    """
+    {iso date: weight} across the window, halving every `half_life` days.
+
+    Exponential decay rather than a shorter window, because those fail
+    differently. A short window swings a level on one slow fortnight; decay
+    keeps every day's evidence and only discounts it, so a style with a long
+    steady history and a soft month drifts down instead of collapsing.
+
+    `half_life <= 0` returns weight 1.0 for every day — the flat average,
+    which is the default and reduces propose() to plain qty / window_days
+    EXACTLY, not approximately. That equality is asserted in the tests: a
+    weighting scheme that quietly moves the unweighted answer would re-price
+    1,093 live levels as a side effect of adding a flag nobody switched on.
+    """
+    span = (to - frm).days
+    out = {}
+    for i in range(span + 1):
+        d = frm + timedelta(days=i)
+        age = (to - d).days
+        out[d.isoformat()] = 1.0 if half_life <= 0 else 0.5 ** (age / half_life)
+    return out
+
+
+def demand_from_movements(moves: list, weights: dict | None = None) -> dict:
     """
     {(item, size): Demand} — dispatch, positive, per channel group.
 
@@ -141,8 +180,14 @@ def demand_from_movements(moves: list) -> dict:
     by_key: dict = {}
     units_seen: dict = defaultdict(set)
     trade = set(TRADE_TYPES)
+    unsized = 0
+    unsized_qty = 0.0
     for m in moves:
         if not m.size_batch:
+            continue
+        if m.size_batch.strip().lower() in UNSIZED_BATCHES:
+            unsized += 1
+            unsized_qty += -m.qty
             continue
         key = (m.item_name, m.size_batch)
         d = by_key.get(key)
@@ -151,12 +196,28 @@ def demand_from_movements(moves: list) -> dict:
                                      unit=m.unit)
         if m.unit:
             units_seen[key].add(m.unit)
+        # A movement dated outside the window cannot be weighted, so it is
+        # not silently given weight 1.0 — that would let a stray voucher from
+        # a neighbouring chunk count as if it happened today.
+        w = 1.0 if weights is None else weights.get(m.date, 0.0)
         if m.voucher_type in trade:
             d.trade_qty += -m.qty
+            d.trade_wqty += -m.qty * w
         else:
             d.other_qty += -m.qty
+            d.other_wqty += -m.qty * w
     for key, seen in units_seen.items():
         by_key[key].units_seen = frozenset(seen)
+    if unsized:
+        # Deliberately log.info, not warning. Most of this total is fabric,
+        # raw material and packing stock, which are not size-tracked at all
+        # and SHOULD carry a placeholder — measured 2026-08-23, 341,825 units
+        # of it against only 4 finished-goods rows. Crying wolf at every run
+        # would train the reader to skip the line that matters.
+        log.info("%d line(s) totalling %.0f carry a placeholder batch rather "
+                 "than a size and get no level. Normal for goods that are not "
+                 "size-tracked; only worth chasing for finished goods.",
+                 unsized, unsized_qty)
     return by_key
 
 
@@ -168,18 +229,34 @@ def round_up(value: float, step: float) -> float:
 
 
 def propose(demand: dict, window_days: int, days_cover: int,
-            step: float = 0.5, mode: str = "trade") -> list[dict]:
+            step: float = 0.5, mode: str = "trade",
+            weight_total: float = 0.0) -> list[dict]:
     """
     One proposal row per (item, size). Pure — no Tally, no Frappe.
 
     `mode` picks which measured demand drives the level; the other channel is
     still carried onto the row so the sheet can show what the choice costs.
+
+    `weight_total` is sum(day_weights) across the window and is the divisor
+    for the weighted total — the weighted MEAN of daily demand, so days with
+    no dispatch still sit in the denominator. Divide by the number of days
+    that happened to have a sale instead and every intermittent style reads
+    as a fast mover. Pass 0 for the flat average over window_days.
+
+    Both rates land on the row. `daily_flat` is the plain average and
+    `daily_demand` is whichever drives the level, so `trend` (their ratio)
+    reads off the sheet directly: above 1 means the style is accelerating and
+    a flat average would have under-levelled it.
     """
     rows = []
     for (item, size), d in demand.items():
-        basis = d.trade_qty if mode == "trade" else d.all_qty
-        basis = max(0.0, basis)
-        daily = basis / window_days if window_days else 0.0
+        basis = max(0.0, d.trade_qty if mode == "trade" else d.all_qty)
+        flat = basis / window_days if window_days else 0.0
+        if weight_total > 0:
+            wbasis = max(0.0, d.trade_wqty if mode == "trade" else d.all_wqty)
+            daily = wbasis / weight_total
+        else:
+            daily = flat
         rows.append({
             "item_name": item,
             "size": size,
@@ -188,6 +265,8 @@ def propose(demand: dict, window_days: int, days_cover: int,
             "other_qty": round(d.other_qty, 2),
             "basis_qty": round(basis, 2),
             "daily_demand": round(daily, 4),
+            "daily_flat": round(flat, 4),
+            "trend": round(daily / flat, 3) if flat else None,
             "proposed_level": round_up(daily * days_cover, step),
             "mixed_units": ",".join(sorted(d.units_seen))
                            if len(d.units_seen) > 1 else "",
@@ -227,7 +306,8 @@ def merge_current(rows: list[dict], levels: dict, groups: dict,
             "base_unit": base_units.get(key[0], ""),
             "stock_group": groups.get(key[0], ""),
             "trade_qty": 0.0, "other_qty": 0.0, "basis_qty": 0.0,
-            "daily_demand": 0.0, "proposed_level": 0.0,
+            "daily_demand": 0.0, "daily_flat": 0.0, "trend": None,
+            "proposed_level": 0.0,
             "mixed_units": "", "current_level": lvl,
         })
     for r in out:
@@ -433,9 +513,9 @@ def load_reference(fc: FrappeClient) -> tuple:
 # ---------------------------------------------------------------------------
 
 COLUMNS = ["stock_group", "item_name", "size", "unit", "base_unit",
-           "trade_qty", "other_qty", "basis_qty", "daily_demand",
-           "proposed_level", "current_level", "change", "status",
-           "mixed_units"]
+           "trade_qty", "other_qty", "basis_qty", "daily_flat",
+           "daily_demand", "trend", "proposed_level", "current_level",
+           "change", "status", "mixed_units"]
 
 
 def write_csv(rows: list[dict], path: str) -> None:
@@ -490,6 +570,11 @@ def main(argv=None) -> int:
                     help="days of stock the level should hold (default 45)")
     ap.add_argument("--to", default="", help="window end, YYYY-MM-DD (default today)")
     ap.add_argument("--demand", choices=["trade", "all"], default="trade")
+    ap.add_argument("--half-life", type=int, default=0, metavar="DAYS",
+                    help="weight recent dispatch more heavily, halving every "
+                         "DAYS. 0 (default) is a flat average over the whole "
+                         "window. 30 on a 90-day window gives the last month "
+                         "about twice the pull of the month before it.")
     ap.add_argument("--round", type=float, default=0.5,
                     help="round levels UP to this step (default 0.5)")
     ap.add_argument("--chunk-days", type=int, default=7)
@@ -518,9 +603,15 @@ def main(argv=None) -> int:
     log.info("Tally %s:%s company=%r", cfg.host, cfg.port, cfg.company)
     types = TRADE_TYPES + OTHER_OUTWARD_TYPES
     moves = collect(cfg, frm, to, types, a.chunk_days, a.cache)
-    demand = demand_from_movements(moves)
+    weights = day_weights(frm, to, a.half_life) if a.half_life > 0 else None
+    weight_total = sum(weights.values()) if weights else 0.0
+    if weights:
+        log.info("Recency weighting: half-life %d days, effective window "
+                 "%.1f days of %d", a.half_life, weight_total, a.window)
+    demand = demand_from_movements(moves, weights)
 
-    rows = propose(demand, a.window, a.days_cover, a.round, a.demand)
+    rows = propose(demand, a.window, a.days_cover, a.round, a.demand,
+                   weight_total)
 
     fcfg = frappe_config(conf)
     if fcfg is None:

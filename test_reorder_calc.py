@@ -126,3 +126,96 @@ def test_config_toml_survives_what_notepad_writes():
                 body.encode("utf-16"),                       # Notepad "Unicode"
                 body.replace("\n", "\r\n").encode("utf-8")):  # CRLF
         assert C._decode_toml(raw) == body, raw[:4]
+
+
+# --- recency weighting ----------------------------------------------------
+# Added because a 90-day flat average LAGS the trend: measured 2026-08-23,
+# Camisol ran 44% above its own 90-day mean while its proposal came out flat,
+# and Cycling Short ran 17% below while its proposal rose.
+
+from datetime import date as _date, timedelta
+
+
+def mvd(day, qty, vtype="Sales", item="A", size="32"):
+    """A movement on a specific date."""
+    return Movement(guid="g", date=day, voucher_type=vtype, voucher_number="1",
+                    item_name=item, size_batch=size, godown="Pack",
+                    bucket="in_stock", qty=qty, unit="Doz", qty_raw=str(abs(qty)))
+
+
+FRM, TO = _date(2026, 5, 25), _date(2026, 8, 22)   # the live 90-day window
+
+
+def test_half_life_zero_is_a_flat_average():
+    w = C.day_weights(FRM, TO, 0)
+    assert set(w.values()) == {1.0}
+    assert len(w) == 90
+
+
+def test_weight_halves_every_half_life():
+    w = C.day_weights(FRM, TO, 30)
+    assert w[TO.isoformat()] == 1.0                       # today: full weight
+    assert abs(w[(TO - timedelta(days=30)).isoformat()] - 0.5) < 1e-9
+    assert abs(w[(TO - timedelta(days=60)).isoformat()] - 0.25) < 1e-9
+
+
+def test_weighting_off_reproduces_the_unweighted_level_EXACTLY():
+    """The flag must not re-price 1,093 live levels as a side effect."""
+    moves = [mvd("2026-06-01", -30), mvd("2026-08-01", -60)]
+    flat = C.propose(C.demand_from_movements(moves), 90, 45, 0.5)
+    same = C.propose(C.demand_from_movements(moves, C.day_weights(FRM, TO, 0)),
+                     90, 45, 0.5, "trade", weight_total=90.0)
+    assert flat[0]["proposed_level"] == same[0]["proposed_level"]
+    assert flat[0]["daily_demand"] == same[0]["daily_demand"]
+
+
+def _level(moves, half_life):
+    w = C.day_weights(FRM, TO, half_life) if half_life else None
+    total = sum(w.values()) if w else 0.0
+    return C.propose(C.demand_from_movements(moves, w), 90, 45, 0.5,
+                     "trade", total)[0]
+
+
+def test_the_same_total_sold_recently_outranks_the_same_total_sold_early():
+    recent = _level([mvd("2026-08-20", -90)], 30)
+    early = _level([mvd("2026-05-26", -90)], 30)
+    assert recent["proposed_level"] > early["proposed_level"]
+    # and flat weighting cannot tell them apart at all
+    assert (_level([mvd("2026-08-20", -90)], 0)["proposed_level"]
+            == _level([mvd("2026-05-26", -90)], 0)["proposed_level"])
+
+
+def test_an_accelerating_style_reads_trend_above_one():
+    row = _level([mvd("2026-06-01", -10), mvd("2026-08-20", -50)], 30)
+    assert row["trend"] > 1.0
+    row = _level([mvd("2026-06-01", -50), mvd("2026-08-20", -10)], 30)
+    assert row["trend"] < 1.0
+
+
+def test_quiet_days_stay_in_the_denominator():
+    """One burst is not a run rate. If the divisor were 'days that had a
+    sale', every intermittent style would price as a fast mover."""
+    row = _level([mvd("2026-08-22", -90)], 30)
+    assert row["daily_demand"] < 5.0, row["daily_demand"]
+
+
+def test_a_movement_dated_outside_the_window_carries_no_weight():
+    """Chunk boundaries can hand back a stray neighbouring voucher. Defaulting
+    an unknown date to weight 1.0 would count it as if it happened today."""
+    row = _level([mvd("2025-01-01", -900)], 30)
+    assert row["proposed_level"] == 0.0
+    assert row["trade_qty"] == 900          # still reported, just not weighted
+
+
+def test_tallys_placeholder_batch_is_not_a_size():
+    """`Primary Batch` is what Tally writes when a batch-tracked item is
+    billed without one. Measured 2026-08-23: it produced the single largest
+    row in the sheet, a 2,029 level against a size that does not exist."""
+    d = C.demand_from_movements([mv("Sales", "PANTY (PCS)", "Primary Batch", -900),
+                                 mv("Sales", "A", "32", -10)])
+    assert list(d) == [("A", "32")]
+
+
+def test_the_placeholder_check_is_not_fooled_by_case_or_padding():
+    d = C.demand_from_movements([mv("Sales", "X", "  PRIMARY BATCH ", -900)])
+    assert d == {}
