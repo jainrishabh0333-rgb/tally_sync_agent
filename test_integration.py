@@ -54,11 +54,11 @@ COMPANIES_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
 </COLLECTION></DATA></BODY></ENVELOPE>"""
 
 # Signs here follow TallyPrime's ACTUAL export convention: Debit is NEGATIVE,
-# Credit is POSITIVE. Acme is a customer filed under the sub-group "AGENT RK",
+# Credit is POSITIVE. Acme is a customer filed under the sub-group "AGENT XY",
 # mirroring the real book where 92% of receivables sit below Sundry Debtors.
 LEDGERS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
  <LEDGER NAME="Acme Traders &amp; Co">
-  <PARENT>AGENT RK</PARENT><OPENINGBALANCE>-50000.00</OPENINGBALANCE>
+  <PARENT>AGENT XY</PARENT><OPENINGBALANCE>-50000.00</OPENINGBALANCE>
   <CLOSINGBALANCE>-168000.00</CLOSINGBALANCE><PARTYGSTIN>27AABCU9603R1ZM</PARTYGSTIN>
   <EMAIL>ap@acme.example</EMAIL><ISBILLWISEON>Yes</ISBILLWISEON>
   <MASTERID>77</MASTERID><ALTERID>1204</ALTERID>
@@ -77,7 +77,7 @@ LEDGERS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
 GROUPS_XML = """<ENVELOPE><BODY><DATA><COLLECTION>
  <GROUP NAME="Sundry Debtors"><PARENT>Current Assets</PARENT></GROUP>
  <GROUP NAME="Sundry Creditors"><PARENT>Current Liabilities</PARENT></GROUP>
- <GROUP NAME="AGENT RK"><PARENT>Sundry Debtors</PARENT></GROUP>
+ <GROUP NAME="AGENT XY"><PARENT>Sundry Debtors</PARENT></GROUP>
  <GROUP NAME="Stitchers"><PARENT>Sundry Creditors</PARENT></GROUP>
  <GROUP NAME="Sales Accounts"><PARENT>Income</PARENT></GROUP>
  <GROUP NAME="Current Assets"><PARENT>Primary</PARENT></GROUP>
@@ -273,7 +273,7 @@ class FrappeHandler(BaseHTTPRequestHandler):
         if path.endswith("ageing_summary"):
             return self._json({"message": {"by": "group", "count": 1,
                 "total_outstanding": 168000.0, "total_overdue": 168000.0,
-                "rows": [{"name": "AGENT RK", "bills": 2, "total": 168000.0,
+                "rows": [{"name": "AGENT XY", "bills": 2, "total": 168000.0,
                           "overdue": 168000.0, "over_90": 0.0,
                           "worst_days": 75, "overdue_pct": 100.0}]}})
         if path.endswith("ageing"):
@@ -356,7 +356,7 @@ def main() -> int:
     check_true("ampersand name parsed", "Acme Traders & Co" in by_name,
                f"got {list(by_name)}")
     acme = by_name["Acme Traders & Co"]
-    check("debtor sits under a sub-group", acme.parent, "AGENT RK")
+    check("debtor sits under a sub-group", acme.parent, "AGENT XY")
     check("debtor balance normalised to debit-positive",
           acme.closing_balance, 168000.0)
     check("gstin", acme.gstin, "27AABCU9603R1ZM")
@@ -369,9 +369,9 @@ def main() -> int:
     groups = fetch_groups(tcfg)
     check("group tree fetched", len(groups), 8)
     gmap = {g.name: g for g in groups}
-    check("customer under AGENT RK resolves to Sundry Debtors",
-          resolve_group_chain("AGENT RK", gmap)[-1] if
-          "Sundry Debtors" not in resolve_group_chain("AGENT RK", gmap) else "Sundry Debtors",
+    check("customer under AGENT XY resolves to Sundry Debtors",
+          resolve_group_chain("AGENT XY", gmap)[-1] if
+          "Sundry Debtors" not in resolve_group_chain("AGENT XY", gmap) else "Sundry Debtors",
           "Sundry Debtors")
     check_true("supplier under Stitchers resolves to Sundry Creditors",
                "Sundry Creditors" in resolve_group_chain("Stitchers", gmap))

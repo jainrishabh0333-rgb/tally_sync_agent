@@ -644,7 +644,7 @@ class Bill:
 class Ledger:
     name: str
     company: str = ""                # which Tally company this belongs to
-    parent: str = ""                 # immediate group, e.g. "AGENT RK"
+    parent: str = ""                 # immediate group, e.g. "AGENT XY"
     primary_group: str = ""          # resolved root, e.g. "Sundry Debtors"
     group_path: str = ""             # full chain, for auditing the resolution
     opening_balance: float = 0.0
@@ -1183,7 +1183,7 @@ def fetch_groups(cfg: TallyConfig) -> list[Group]:
     Export the account-group tree.
 
     Needed because real charts of accounts nest: this book files customers
-    under groups like "AGENT RK" and "Sundry Debtors Online", which are
+    under groups like "AGENT XY" and "Sundry Debtors Online", which are
     themselves children of "Sundry Debtors". Classifying a ledger by its
     immediate parent alone misses them — in this book that was 92% of
     receivables.
@@ -1209,7 +1209,7 @@ def fetch_groups(cfg: TallyConfig) -> list[Group]:
 
 # TallyPrime's 28 reserved groups. Every custom group ultimately descends from
 # one of these, so the nearest reserved ancestor is the level at which a ledger
-# is meaningfully classified — "Sundry Debtors" rather than "AGENT RK" below it
+# is meaningfully classified — "Sundry Debtors" rather than "AGENT XY" below it
 # or "Primary" above it.
 TALLY_RESERVED_GROUPS = frozenset({
     "Branch / Divisions", "Capital Account", "Current Assets", "Current Liabilities",
@@ -1227,7 +1227,7 @@ def classify_group(chain: list[str]) -> str:
     Pick the level at which a ledger should be reported, given its group chain.
 
     Returns the nearest reserved-group ancestor. For a customer filed under
-    "AGENT RK", the chain is [AGENT RK, Sundry Debtors, Current Assets, Primary]
+    "AGENT XY", the chain is [AGENT XY, Sundry Debtors, Current Assets, Primary]
     and this returns "Sundry Debtors" — specific enough to be useful, general
     enough to aggregate. Falls back to the outermost group when nothing in the
     chain is a reserved name, which happens only with a non-standard chart.

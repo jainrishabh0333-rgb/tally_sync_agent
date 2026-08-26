@@ -23,7 +23,7 @@ REPORT = """DISPATCH READINESS — 21-Aug-2026 (orders 07-Jul onward, oldest ord
    50%  SO/A-VERY-LONG-VOUCHER/9 2026-08-01  SOME  DOUBLE  SPACED - PARTY      5/10 (+2.5 unknown)
         short 3: ITEM ONE S-XL-(Doz)
         short 2: ITEM TWO XXL-(Doz)
-    0%  1205             2026-08-13  SAMRAT HOSIERY-AURANGABAD              0/0 (+194 unknown)
+    0%  1205             2026-08-13  SAMPLE HOSIERY-AURANGABAD              0/0 (+194 unknown)
 
 ========================================================================
 ITEMS BLOCKING DISPATCH — pending demand the stock cannot cover

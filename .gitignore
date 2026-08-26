@@ -26,6 +26,10 @@ resp-*.xml
 rates_master.json
 masters_cache.json
 
+# Raw voucher pull from live Tally — real parties, GSTINs, addresses, rates.
+# Regenerate locally with fetch_order_sample.py; it must never be committed.
+sample_orders.xml
+
 # Rendered dispatch-readiness pages. They name parties, order numbers and
 # shortfalls — internal only, and this repo is public. The renderer and its
 # template are tracked; their output never is.

@@ -468,7 +468,7 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     log.info("Syncing ledger masters...")
 
     # Groups first: real charts of accounts nest customers under sub-groups
-    # (e.g. "AGENT RK" under "Sundry Debtors"), and classifying by immediate
+    # (e.g. "AGENT XY" under "Sundry Debtors"), and classifying by immediate
     # parent alone would miss them.
     groups = fetch_groups(st.tally)
     by_name = {g.name: g for g in groups}
@@ -511,7 +511,7 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
         # the master's line breaks); the mirror keeps the flat `address`.
         row.pop("address_lines", None)
         # The agent (salesperson) is the immediate group under Sundry
-        # Debtors in this book — "AGENT RK" and the like. No ledger UDF
+        # Debtors in this book — "AGENT XY" and the like. No ledger UDF
         # carries it (inspected 2026-08-15: the export shows no UDF tags on
         # ledgers), so the group IS the answer; agent_source records that so
         # nothing downstream re-derives it.

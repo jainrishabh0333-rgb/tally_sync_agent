@@ -70,7 +70,7 @@ def queue_rows(rate=1740, unit="Box", second: dict | None = None) -> dict:
     return {
         "order_key": "TEST-1", "order_no": "1205",
         "company": "SN JAIN INDUSTRIES PVT LTD - (26-27)",
-        "party_ledger": "SAMRAT HOSIERY-AURANGABAD",
+        "party_ledger": "SAMPLE HOSIERY-AURANGABAD",
         "order_date": "2026-08-13",
         "lines": [dict(row, size_batch="S", qty=3),
                   dict(row, size_batch="M", qty=6, **(second or {}))],
@@ -82,13 +82,13 @@ def queue_rows(rate=1740, unit="Box", second: dict | None = None) -> dict:
 MAHARASHTRA_PARTY = {
     "address_lines": ["Shop 4, Cloth Market", "Aurangabad, Maharashtra, 431001"],
     "state": "Maharashtra", "pincode": "431001",
-    "mailing_name": "SAMRAT HOSIERY", "gst_registration_type": "Regular",
+    "mailing_name": "SAMPLE HOSIERY", "gst_registration_type": "Regular",
 }
 UP_PARTY = dict(MAHARASHTRA_PARTY, state="Uttar Pradesh")
 
 
 def envelope(raw: dict, party: dict | None = MAHARASHTRA_PARTY,
-             gstin: str = "27AWRPS7219L1ZL") -> str:
+             gstin: str = "27AAAAA0000A1Z5") -> str:
     return build_envelope(normalise_order(raw), load_order_settings(),
                           gstin, False, party)
 
@@ -149,7 +149,7 @@ check("the buyer block carries the same lines",
       MAHARASHTRA_PARTY["address_lines"])
 check("mailing name comes from the master, not the ledger name",
       re.findall(r"<PARTYMAILINGNAME>([^<]*)</PARTYMAILINGNAME>", addr_xml),
-      ["SAMRAT HOSIERY"])
+      ["SAMPLE HOSIERY"])
 check("pincode is written for buyer and consignee",
       re.findall(r"<(?:PARTY|CONSIGNEE)PINCODE>([^<]*)</(?:PARTY|CONSIGNEE)PINCODE>",
                  addr_xml), ["431001", "431001"])

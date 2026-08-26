@@ -228,11 +228,11 @@ check("creditors group net flips to negative (was +10,11,16,657.28)",
       round(_to_debit_positive("101116657.28"), 2), -101116657.28)
 
 print("\ngroup hierarchy resolution (this book's real structure)")
-# Sundry Debtors > AGENT RK > <customer ledgers>, and Sundry Debtors Online.
+# Sundry Debtors > AGENT XY > <customer ledgers>, and Sundry Debtors Online.
 GROUPS = {g.name: g for g in [
     Group("Sundry Debtors", "Current Assets"),
     Group("Current Assets", "Primary"),
-    Group("AGENT RK", "Sundry Debtors"),
+    Group("AGENT XY", "Sundry Debtors"),
     Group("AGENT JAISON", "Sundry Debtors"),
     Group("Sundry Debtors Online", "Sundry Debtors"),
     Group("Sundry Creditors", "Current Liabilities"),
@@ -240,8 +240,8 @@ GROUPS = {g.name: g for g in [
     Group("Stitchers", "Sundry Creditors"),
     Group("Transporter", "Sundry Creditors"),
 ]}
-chain = resolve_group_chain("AGENT RK", GROUPS)
-check("AGENT RK resolves up through Sundry Debtors",
+chain = resolve_group_chain("AGENT XY", GROUPS)
+check("AGENT XY resolves up through Sundry Debtors",
       "Sundry Debtors" in chain, True)
 check("Stitchers resolves up through Sundry Creditors",
       "Sundry Creditors" in resolve_group_chain("Stitchers", GROUPS), True)
