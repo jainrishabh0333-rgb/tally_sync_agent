@@ -26,6 +26,10 @@
       4. It corrects a reorder task scheduled before Tally opens, on every
          run, before that early exit -- so the box repairs a schedule nobody
          can log in to fix. See Repair-ReorderSchedule.
+      5. It restarts a Tailscale client that has gone quiet, on every run,
+         also before the early exit -- because order sends reach Tally over
+         the tailnet and nothing else on the box notices when it drops.
+         See Repair-Tailscale.
 
     Run by hand to force a refresh:
         powershell -ExecutionPolicy Bypass -File C:\tally_bridge\self_update.ps1
@@ -120,6 +124,74 @@ try {
     Repair-ReorderSchedule -TaskName $ReorderTask -At $ReorderAt -OpensAt $TallyOpensAt
 } catch {
     Write-Log "WARN  could not check the $ReorderTask schedule: $($_.Exception.Message)"
+}
+
+# --- 0b. restart a Tailscale client that has dropped off the tailnet ---------
+
+function Repair-Tailscale {
+    <#
+        Why the updater watches a VPN service: order sends reach Tally
+        INBOUND over Tailscale on port 9000, while the sync that feeds the
+        mirror pushes OUTBOUND over plain HTTPS. So when the Tailscale
+        client dropped its connection on 2026-08-25, every dashboard stayed
+        green -- fresh mirror, clean sync log -- while every send failed at
+        the socket, and it stayed that way for 34 hours because nothing on
+        the box noticed. This function is the thing that notices.
+
+        Two distinct failures, two distinct fixes:
+          - the Windows service is stopped: start it.
+          - the service runs but the client is disconnected from the
+            tailnet: restart the service. Except NeedsLogin -- only a
+            person can reauthenticate, so that is logged loudly and NOT
+            restarted, four times an hour, to no effect.
+
+        A restart is attempted at most once per hour (stamp file in the
+        task directory), so a client that is broken for a deeper reason is
+        not bounced endlessly. As with everything in section 0: wrapped by
+        the caller, because a failure here must never stop an update, still
+        less a sync.
+    #>
+    param([string]$StampDir)
+
+    $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+    if (-not $svc) { return }
+
+    if ($svc.Status -ne "Running") {
+        Start-Service -Name "Tailscale" -ErrorAction Stop
+        Write-Log ("FIXED  Tailscale service was {0}; started it" -f $svc.Status)
+        return
+    }
+
+    $cli = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+    if (-not (Test-Path $cli)) { return }
+
+    $raw = & $cli status --json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { return }
+    $st = ($raw -join "`n") | ConvertFrom-Json
+
+    if ($st.BackendState -eq "NeedsLogin") {
+        Write-Log "WARN  Tailscale is logged out; a service restart cannot fix this -- reauthenticate on the box"
+        return
+    }
+
+    $selfOnline = $false
+    if ($st.Self -and $st.Self.Online) { $selfOnline = $true }
+    if ($st.BackendState -eq "Running" -and $selfOnline) { return }
+
+    $stamp = Join-Path $StampDir "tailscale_restart.stamp"
+    if (Test-Path $stamp) {
+        $age = (Get-Date) - (Get-Item $stamp).LastWriteTime
+        if ($age.TotalMinutes -lt 60) { return }
+    }
+    Get-Date -Format "yyyy-MM-dd HH:mm:ss" | Set-Content -Path $stamp -Encoding UTF8
+    Restart-Service -Name "Tailscale" -Force -ErrorAction Stop
+    Write-Log ("FIXED  Tailscale backend {0}, self online {1}; restarted the service" -f $st.BackendState, $selfOnline)
+}
+
+try {
+    Repair-Tailscale -StampDir $TaskDir
+} catch {
+    Write-Log "WARN  could not check Tailscale: $($_.Exception.Message)"
 }
 
 # --- 1. what is live, and what is on GitHub ---------------------------------
