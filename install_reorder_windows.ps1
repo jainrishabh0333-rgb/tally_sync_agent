@@ -24,9 +24,15 @@
 
 param(
     [string]$TaskName  = "TallyBridgeReorder",
-    # 24-hour clock. Early enough that the numbers are ready before the
-    # cutting decisions get made.
-    [string]$AtTime    = "06:30",
+    # 24-hour clock, and it must fall inside Tally's working hours. This was
+    # 06:30 until 2026-08-26, on the reasoning that the numbers should be ready
+    # before the cutting decisions get made. They never were: Tally is not open
+    # at 06:30, so the task failed every single day from the day it was
+    # registered. Measured across a week of sync logs, the first connection
+    # that succeeds lands between 10:10 and 10:55, and once as late as 13:19.
+    # 11:30 clears every observed opening but one, and the retry window below
+    # covers that one.
+    [string]$AtTime    = "11:30",
     # Which company's movements to apply. Reorder levels are per item+size and
     # not company-scoped, so refreshing against more than one book would
     # double-count every movement.
@@ -90,7 +96,7 @@ if (-not (Test-Path $configPath)) {
 # --- prove it runs before scheduling it -------------------------------------
 # A dry run writes nothing and exits non-zero if Tally or Frappe is
 # unreachable, or if no reorder levels have been exported yet. Better to fail
-# here, in front of someone, than at 06:30 into a log nobody opens.
+# here, in front of someone, than on a schedule into a log nobody opens.
 Write-Host "Verifying the refresh runs (dry run, writes nothing)..."
 
 # The company is set here exactly as the wrapper sets it, so this dry run
@@ -154,9 +160,13 @@ $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccou
 # wrong for a once-a-day job, where losing the attempt means a day of stale
 # numbers. Retrying at the SCHEDULER level fixes it here without lengthening
 # backoffs for every other job that shares that HTTP client.
+#
+# Widened from 3x10min to 6x20min on 2026-08-26. Half an hour of retries only
+# covers a Frappe restart; two hours also covers Tally opening late, which is
+# the other reason a daily run is lost and the more common one.
 $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
                 -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
-                -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
+                -RestartCount 6 -RestartInterval (New-TimeSpan -Minutes 20)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings `

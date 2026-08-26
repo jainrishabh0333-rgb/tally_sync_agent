@@ -23,6 +23,9 @@
          there, and the live folder is never touched.
       3. It checks the commit before it downloads. Unchanged means one small
          API call and an exit, four times an hour.
+      4. It corrects a reorder task scheduled before Tally opens, on every
+         run, before that early exit -- so the box repairs a schedule nobody
+         can log in to fix. See Repair-ReorderSchedule.
 
     Run by hand to force a refresh:
         powershell -ExecutionPolicy Bypass -File C:\tally_bridge\self_update.ps1
@@ -33,6 +36,11 @@ param(
     [string]$TaskDir  = "",
     [string]$Repo     = "jainrishabh0333-rgb/tally_sync_agent",
     [string]$Branch   = "main",
+    # Reorder-task schedule reconciliation. See Repair-ReorderSchedule below for
+    # why a script that only copies files also corrects a scheduled task.
+    [string]$ReorderTask   = "TallyBridgeReorder",
+    [string]$ReorderAt     = "11:30",
+    [string]$TallyOpensAt  = "10:00",
     [switch]$Force
 )
 
@@ -56,6 +64,62 @@ function Write-Log([string]$msg) {
     if ($lines.Count -gt 800) {
         Set-Content -Path $logPath -Value ($lines[-400..-1]) -Encoding UTF8
     }
+}
+
+# --- 0. correct a reorder task that fires before Tally is open --------------
+
+function Repair-ReorderSchedule {
+    <#
+        Why this lives in the updater rather than in the installer that created
+        the task: the installer only runs when a person runs it, and the whole
+        point of this box is that nobody has to. TallyBridgeReorder was
+        registered at 06:30 on 2026-08-23 and never completed a single run,
+        because Tally is not open then -- measured over a week of sync logs,
+        the first connection that succeeds on any day lands between 10:10 and
+        10:55. The task failed, retried three times ten minutes apart, and gave
+        up three hours before the engine came up. Nothing reported it: the
+        reorder rows simply kept the date of the last manual export while every
+        dashboard read healthy.
+
+        Deliberately narrow. It corrects ONLY the condition that can never
+        work -- a daily trigger before Tally opens -- and leaves any later time
+        alone, so re-timing the task by hand is not undone on the next push.
+        Everything it touches is wrapped: a failure here must never stop an
+        update, still less a sync.
+    #>
+    param([string]$TaskName, [string]$At, [string]$OpensAt)
+
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) { return }
+    if (-not $task.Triggers -or $task.Triggers.Count -lt 1) { return }
+
+    $trigger = $task.Triggers[0]
+    if (-not $trigger.StartBoundary) { return }
+
+    $current = ([datetime]$trigger.StartBoundary).TimeOfDay
+    $opens   = [timespan]$OpensAt
+    if ($current -ge $opens) { return }
+
+    $want    = [timespan]$At
+    $stamp   = (Get-Date).Date.Add($want).ToString("yyyy-MM-ddTHH:mm:ss")
+    $trigger.StartBoundary = $stamp
+
+    # Widen the retry window while we are here. Three retries ten minutes apart
+    # covers half an hour; Tally came up as late as 13:19 on one observed day,
+    # so six retries twenty minutes apart -- two hours -- is what makes a fixed
+    # daily time safe. Losing a run costs a day of stale numbers.
+    $task.Settings.RestartCount    = 6
+    $task.Settings.RestartInterval = "PT20M"
+
+    $task | Set-ScheduledTask -ErrorAction Stop | Out-Null
+    Write-Log ("FIXED  {0} fired at {1}, before Tally opens; moved to {2}" -f `
+               $TaskName, $current.ToString("hh\:mm"), $At)
+}
+
+try {
+    Repair-ReorderSchedule -TaskName $ReorderTask -At $ReorderAt -OpensAt $TallyOpensAt
+} catch {
+    Write-Log "WARN  could not check the $ReorderTask schedule: $($_.Exception.Message)"
 }
 
 # --- 1. what is live, and what is on GitHub ---------------------------------
