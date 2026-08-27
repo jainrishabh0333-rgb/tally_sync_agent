@@ -355,11 +355,19 @@ check_true("connect timeout is not mistaken for a closed port",
            not isinstance(_conn_timeout, TallyUnreachable))
 
 # The sync loop must record it as Skipped, not Failed — that is the whole
-# point, and it is one string away from silently reverting.
+# point, and it is one string away from silently reverting. A run that got
+# part way before Tally went away is Partial instead: same non-failure, but
+# the log must not claim nothing was written.
 _src = (pathlib.Path(__file__).with_name("sync.py")).read_text()
-check_true("sync.py logs an unreachable Tally as Skipped",
+check_true("sync.py logs an unreachable Tally as Skipped, not Failed",
            'except TallyUnreachable' in _src
-           and 'fc.log_sync("Skipped", counts)' in _src)
+           and 'fc.log_sync(status, counts)' in _src
+           and '"Partial" if partial_run else "Skipped"' in _src)
+check_true("the Partial/Skipped split is decided by writes, not by counts",
+           'writes_before = fc.writes' in _src
+           and 'fc.writes > writes_before' in _src)
+check_true("a partial run is not counted as a failure",
+           'return 1 if failed else 0' in _src)
 
 
 # --- the agent reports which commit it is running -------------------------
@@ -369,7 +377,8 @@ check_true("sync.py logs an unreachable Tally as Skipped",
 # silence forever. The commit now rides every sync-log row instead.
 
 import tempfile as _tf
-from frappe_client import FrappeClient, FrappeConfig, _read_commit, agent_commit
+from frappe_client import (FrappeClient, FrappeConfig, FrappeError,
+                           _read_commit, agent_commit)
 
 _d = _tf.mkdtemp()
 _v = pathlib.Path(_d) / "VERSION.txt"
@@ -403,6 +412,59 @@ check_true("every sync-log row carries agent_commit",
 check("the caller's counts dict is not mutated", _counts, {"ledgers": 3})
 check("agent_commit is a string even with no VERSION.txt",
       isinstance(agent_commit(), str), True)
+
+
+# --- writes counter: the evidence behind Partial vs Skipped ---------------
+# The counts in the sync log cannot decide this. A sync_* helper accumulates
+# its total in a local and returns it at the end, so one that raises mid-loop
+# reports 0 for rows that are already in Frappe. The client counts the calls
+# that actually landed instead.
+
+class _CountingClient(FrappeClient):
+    """Real _call bookkeeping, no network."""
+    def __init__(self):
+        self.status = 200
+
+    def _call(self, method, path, **kw):
+        # Mirror the ordering in the real _call: a 4xx raises BEFORE the
+        # write is counted, because a rejected call wrote nothing.
+        if self.status >= 400:
+            raise FrappeError(f"Frappe {self.status} on {path}")
+        if "upsert_" in path:
+            self.writes += 1
+        return {}
+
+
+_fc = _CountingClient()
+check("a fresh client has written nothing", _fc.writes, 0)
+
+_fc.upsert_vouchers([{"guid": "x"}])
+check("an upsert counts as a write", _fc.writes, 1)
+
+_fc.upsert_ledgers([{"name": "y"}])
+_fc.upsert_sales_orders([{"guid": "z"}])
+check("every upsert family counts", _fc.writes, 3)
+
+_fc.log_sync("Skipped", {})
+_fc.get_sync_state()
+check("reads and the sync-log row are not writes", _fc.writes, 3)
+
+# The half-written case this whole change exists for: some rows land, then
+# Tally goes away. The counter must show the difference across the window.
+_before = _fc.writes
+_fc.status = 500
+try:
+    _fc.upsert_vouchers([{"guid": "boom"}])
+except FrappeError:
+    pass
+check("a rejected upsert is not counted as a write", _fc.writes, _before)
+check_true("no write across the window reads as a true no-op",
+           not (_fc.writes > _before))
+
+_fc.status = 200
+_fc.upsert_vouchers([{"guid": "ok"}])
+check_true("one write across the window marks the run partial",
+           _fc.writes > _before)
 
 print()
 if failures:

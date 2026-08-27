@@ -82,10 +82,22 @@ class FrappeConfig:
 
 
 class FrappeClient:
+    # How many mirror-write calls have landed on this client. The sync loop
+    # reads it either side of a company to tell a run that wrote nothing from
+    # one that wrote part of the window before Tally went away — those two
+    # look identical in the counts, because a sync_* helper that raises
+    # mid-loop never returns the total it had accumulated.
+    #
+    # Declared on the class, not only in __init__, so a test double that
+    # subclasses without calling super().__init__ still reads 0 rather than
+    # raising AttributeError.
+    writes = 0
+
     def __init__(self, cfg: FrappeConfig):
         self.cfg = cfg
         self.session = requests.Session()
         self.session.headers.update(cfg.headers())
+        self.writes = 0
 
     # -- generic helpers ----------------------------------------------------
 
@@ -153,6 +165,11 @@ class FrappeClient:
 
         if resp.status_code >= 400:
             raise FrappeError(f"Frappe {resp.status_code} on {path}: {body[:300]}")
+        # Counted here because every upsert_* helper below funnels through
+        # this one method, so no future one can forget to. Reads and the
+        # sync-log write itself are not mirror data and must not count.
+        if "upsert_" in path:
+            self.writes += 1
         try:
             return resp.json()
         except ValueError:
