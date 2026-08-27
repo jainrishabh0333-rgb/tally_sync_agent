@@ -51,10 +51,30 @@ def agent_commit(path: str = "") -> str:
 
 
 def _read_commit(path: str) -> str:
-    """The `commit <sha>` line of a VERSION.txt, or "" if unreadable."""
+    """
+    The `commit <sha>` line of a VERSION.txt, or "" if unreadable.
+
+    Decoded as utf-8-SIG, not utf-8. self_update.ps1 writes this file with
+    `Set-Content -Encoding UTF8`, and in Windows PowerShell 5.1 -- what the
+    Tally box runs -- that means UTF-8 WITH a BOM. Read as plain utf-8 the
+    BOM survives as \ufeff on the front of the first line, "commit ..." no
+    longer starts with "commit ", and this returned "" for a VERSION.txt that
+    was present and correct.
+
+    That cost a diagnosis: every deploy reported the box had never updated,
+    while the box was up to date and the file said so. The same BOM already
+    bit config.toml once (see reorder_level_calc.py, and the commit "Decode
+    config.toml the way Notepad writes it"); this read was written afterwards
+    and repeated it. utf-8-sig strips a BOM when there is one and is
+    identical to utf-8 when there is not.
+
+    lstrip() on top, so a stray BOM anywhere but the first byte -- or an
+    indented line -- cannot quietly do the same thing again.
+    """
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
             for line in fh:
+                line = line.lstrip("\ufeff \t")
                 if line.startswith("commit "):
                     return line.split(None, 1)[1].strip()
     except OSError:

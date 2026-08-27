@@ -392,6 +392,25 @@ _v.write_text("no commit line here at all\n")
 check("a VERSION.txt without a commit line reads as empty",
       _read_commit(str(_v)), "")
 
+# The box writes this file from PowerShell 5.1, whose `Set-Content -Encoding
+# UTF8` means UTF-8 WITH a BOM. Read as plain utf-8 the BOM rides on the front
+# of the first line and "commit ..." stops starting with "commit " -- so a
+# present, correct VERSION.txt read as empty and every deploy reported that
+# the box had never updated. Written as bytes here because that is exactly
+# what PowerShell puts on disk.
+_v.write_bytes(b"\xef\xbb\xbfcommit aae866fdeadbeef\nbranch main\n")
+check("a PowerShell UTF8 BOM does not hide the commit",
+      _read_commit(str(_v)), "aae866fdeadbeef")
+
+# utf-8-sig must not change the no-BOM case it already handled.
+_v.write_bytes(b"commit plain0123abc\nbranch main\n")
+check("a file without a BOM still reads the same",
+      _read_commit(str(_v)), "plain0123abc")
+
+# CRLF is what a Windows-written file actually has; .strip() must survive it.
+_v.write_bytes(b"\xef\xbb\xbfcommit crlf456def\r\nbranch main\r\n")
+check("BOM plus CRLF still reads clean", _read_commit(str(_v)), "crlf456def")
+
 
 class _Capture(FrappeClient):
     """Records the payload instead of sending it."""
