@@ -297,7 +297,8 @@ def date_chunks(frm: date, to: date, days: int):
 # Sync steps
 # ---------------------------------------------------------------------------
 
-def sync_inventory(st: Settings, fc: FrappeClient) -> int:
+def sync_inventory(st: Settings, fc: FrappeClient,
+                   progress: dict | None = None) -> int:
     """
     Mirror inventory masters: units, godowns, stock groups, then items.
 
@@ -343,6 +344,8 @@ def sync_inventory(st: Settings, fc: FrappeClient) -> int:
         stock_groups=[dataclasses.asdict(g) for g in groups],
         stock_items=[dataclasses.asdict(i) for i in items],
     ) or {}
+    # One request, so this is all-or-nothing: reaching here means it landed.
+    _mark(progress, "items", len(items))
     msg = res.get("message", res) if isinstance(res, dict) else {}
     for kind in ("units", "godowns", "stock_groups", "stock_items"):
         _report_rejects(msg.get(kind) or {}, kind[:-1])
@@ -370,7 +373,8 @@ _last_bill_fetch: tuple = ()
 _BILL_BATCH = 500
 
 
-def sync_bills(st: Settings, fc: FrappeClient) -> int:
+def sync_bills(st: Settings, fc: FrappeClient,
+               progress: dict | None = None) -> int:
     """
     Mirror outstanding bills for the current company.
 
@@ -427,6 +431,7 @@ def sync_bills(st: Settings, fc: FrappeClient) -> int:
         rejected += _report_rejects(msg, "bill")
         if isinstance(msg, dict):
             created += int(msg.get("created") or 0)
+        _mark(progress, "bills", created)
     # `created` is summed from what Frappe actually stored across the batches,
     # not from what was sent: it is the only figure that proves a row exists,
     # and len(payload) says nothing.
@@ -439,6 +444,23 @@ def sync_bills(st: Settings, fc: FrappeClient) -> int:
                   "Frappe log for a rolled-back transaction.",
                   len(payload) - rejected - created)
     return created
+
+
+def _mark(progress: dict | None, key: str, value) -> None:
+    """
+    Publish a running total while a sync is still in flight.
+
+    Each sync_* helper below accumulates into a local and returns it at the
+    end, which is correct until Tally goes away mid-loop: the helper raises,
+    the local dies with it, and the sync log records 0 for batches that are
+    already in Frappe. A Partial row then understated itself to nothing.
+
+    So every helper reports each batch as it lands. Passing the caller's own
+    counts dict means the figure is already there when the exception unwinds,
+    with no bookkeeping at the call site to forget.
+    """
+    if progress is not None:
+        progress[key] = value
 
 
 def _report_rejects(msg, kind: str) -> int:
@@ -464,7 +486,8 @@ def _report_rejects(msg, kind: str) -> int:
     return int(msg.get("failed") or len(errs))
 
 
-def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
+def sync_ledgers(st: Settings, fc: FrappeClient,
+                 progress: dict | None = None) -> int:
     log.info("Syncing ledger masters...")
 
     # Groups first: real charts of accounts nest customers under sub-groups
@@ -535,6 +558,7 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
         rejected += _report_rejects(msg, "ledger")
         pruned += int(msg.get("pruned_duplicates") or 0)
         pushed += len(batch)
+        _mark(progress, "ledgers", pushed - rejected)
         log.info("  ledgers %d/%d", pushed, len(payload))
     if rejected:
         log.warning("%d ledger(s) were rejected by Frappe and NOT mirrored "
@@ -550,7 +574,8 @@ def sync_ledgers(st: Settings, fc: FrappeClient) -> int:
     return pushed - rejected
 
 
-def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date) -> int:
+def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date,
+                  progress: dict | None = None) -> int:
     log.info("Syncing vouchers %s .. %s", frm, to)
     total = 0
     for c_from, c_to in date_chunks(frm, to, st.chunk_days):
@@ -565,13 +590,15 @@ def sync_vouchers(st: Settings, fc: FrappeClient, frm: date, to: date) -> int:
             msg = res.get("message", res) if isinstance(res, dict) else {}
             rejected += _report_rejects(msg, "voucher")
         total += len(payload) - rejected
+        _mark(progress, "vouchers", total)
         log.info("  %s..%s: %d vouchers%s", c_from, c_to, len(payload) - rejected,
                  f" ({rejected} rejected)" if rejected else "")
     return total
 
 
 def sync_distributor_docs(st: Settings, fc: FrappeClient,
-                          frm: date, to: date) -> dict:
+                          frm: date, to: date,
+                          progress: dict | None = None) -> dict:
     """
     Mirror the distributor-facing documents for [frm, to]: sales orders,
     invoices, receipts, delivery notes (if the book has any), and the
@@ -583,6 +610,9 @@ def sync_distributor_docs(st: Settings, fc: FrappeClient,
     """
     counts = {"sales_orders": 0, "invoices": 0, "receipts": 0,
               "delivery_notes": 0, "size_balances": 0}
+    # Published once, by reference: the caller sees each += below as it
+    # happens, so no per-family _mark call is needed and none can be missed.
+    _mark(progress, "distributor", counts)
     harvest: list = []
 
     for c_from, c_to in date_chunks(frm, to, st.chunk_days):
@@ -844,20 +874,29 @@ def main() -> int:
         writes_before = fc.writes
         log.info("--- %s ---", company)
         try:
+            # Each helper is handed `counts` so it can report batches as they
+            # land. Without that, a mid-loop TallyUnreachable unwinds past the
+            # assignment and the Partial row claims 0 for rows already stored.
             if not args.vouchers_only:
-                counts["ledgers"] = sync_ledgers(st, fc)
+                counts["ledgers"] = sync_ledgers(st, fc, progress=counts)
                 # Bills come after ledgers so party group and GSTIN are
                 # already present to denormalise onto each bill.
                 if not args.no_bills:
-                    counts["bills"] = sync_bills(st, fc)
+                    counts["bills"] = sync_bills(st, fc, progress=counts)
                 if not args.no_inventory:
-                    counts["items"] = sync_inventory(st, fc)
+                    counts["items"] = sync_inventory(st, fc, progress=counts)
             if not args.ledgers_only:
                 frm, to = resolve_range(st, fc, args, company)
-                counts["vouchers"] = sync_vouchers(st, fc, frm, to)
+                # Recorded BEFORE the pull, not after it: the window a partial
+                # run was attempting is exactly what the next reader needs,
+                # and setting it afterwards meant a run that died inside
+                # sync_vouchers reported no range at all.
                 counts["range"] = f"{frm}..{to}"
+                counts["vouchers"] = sync_vouchers(st, fc, frm, to,
+                                                   progress=counts)
                 if not args.no_distributor:
-                    counts["distributor"] = sync_distributor_docs(st, fc, frm, to)
+                    counts["distributor"] = sync_distributor_docs(
+                        st, fc, frm, to, progress=counts)
         except TallyUnreachable as exc:
             # Tally is not running. On this hosted box that is the normal
             # state outside working hours, and it is not a fault: the next run

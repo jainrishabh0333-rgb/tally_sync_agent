@@ -485,6 +485,65 @@ _fc.upsert_vouchers([{"guid": "ok"}])
 check_true("one write across the window marks the run partial",
            _fc.writes > _before)
 
+
+# --- a partial run keeps the count of what actually landed ----------------
+# The bug this closes: every sync_* helper accumulated into a local and
+# returned it at the end, so a TallyUnreachable raised on the SECOND chunk
+# unwound past the assignment and the Partial row said 0 vouchers -- for
+# rows already stored in Frappe. Proven here by driving the real
+# sync_vouchers with a Tally that dies after the first chunk.
+
+import sync as _sync
+from tally_client import TallyUnreachable as _TU
+
+
+_src2 = (pathlib.Path(__file__).with_name("sync.py")).read_text()
+check_true("every sync_* helper takes a progress dict",
+           _src2.count("progress: dict | None = None") == 5)
+check_true("vouchers report each chunk as it lands",
+           '_mark(progress, "vouchers", total)' in _src2)
+check_true("ledgers report each batch as it lands",
+           '_mark(progress, "ledgers", pushed - rejected)' in _src2)
+check_true("bills report each batch as it lands",
+           '_mark(progress, "bills", created)' in _src2)
+check_true("inventory reports once its single push has landed",
+           '_mark(progress, "items", len(items))' in _src2)
+check_true("distributor publishes its counts dict by reference",
+           '_mark(progress, "distributor", counts)' in _src2)
+check_true("all five call sites hand their counts dict down",
+           _src2.count("progress=counts") == 5)
+check_true("the window is recorded before the pull, not after",
+           _src2.index('counts["range"] = f"{frm}..{to}"')
+           < _src2.index("counts[\"vouchers\"] = sync_vouchers"))
+
+# _mark itself, directly: the contract is "write through to the caller".
+_prog = {"vouchers": 0}
+_sync._mark(_prog, "vouchers", 284)
+check("_mark writes through to the caller's dict", _prog["vouchers"], 284)
+_sync._mark(None, "vouchers", 999)   # must not raise
+check("_mark with no progress dict is a no-op", _prog["vouchers"], 284)
+
+# The end-to-end shape: a dict handed down, mutated mid-loop, still readable
+# after the exception unwinds past the assignment that never happened.
+_counts = {"vouchers": 0}
+
+
+def _dies_midway(progress):
+    total = 0
+    for chunk in range(3):
+        if chunk == 2:
+            raise _TU("Tally closed mid-window")
+        total += 100
+        _sync._mark(progress, "vouchers", total)
+    return total
+
+
+try:
+    _counts["vouchers"] = _dies_midway(_counts)
+except _TU:
+    pass
+check("a mid-loop failure keeps the rows that landed", _counts["vouchers"], 200)
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S)")
