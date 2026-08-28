@@ -350,6 +350,20 @@ class FrappeClient:
             json={"receipts": receipts},
         )
 
+    def upsert_item_sizes(self, sizes: dict[str, list],
+                          company: str) -> dict:
+        """
+        The authoritative size ladder per item, in Tally's own listing order.
+
+        Without this a size never sighted on a recent voucher is
+        indistinguishable from a size that does not exist, and every size
+        display in the app is an inference.
+        """
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_item_sizes",
+            json={"sizes": sizes, "company": company},
+        )
+
     def upsert_production_entries(self, entries: list[dict[str, Any]]) -> dict:
         """
         Cutting, job work, pressing and packing — with their ITEM lines.

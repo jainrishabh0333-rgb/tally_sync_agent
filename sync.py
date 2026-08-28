@@ -660,11 +660,23 @@ def sync_distributor_docs(st: Settings, fc: FrappeClient,
         _report_rejects(msg, "size balance")
         counts["size_balances"] = len(balances)
 
+    # The authoritative size ladder, one modest walk per pass. Guarded so a
+    # walk failure can never cost the documents already pushed above —
+    # sizes are a convenience; vouchers are the mirror.
+    try:
+        ladders = distributor_fetch.fetch_item_sizes(st.tally, to, frm)
+        if ladders:
+            res = fc.upsert_item_sizes(ladders, st.tally.company) or {}
+            msg = res.get("message", res) if isinstance(res, dict) else {}
+            counts["size_ladders"] = int(msg.get("items") or 0)
+    except Exception as exc:
+        log.warning("Size-ladder walk skipped: %s", exc)
+
     log.info("Distributor docs %s..%s: %d orders, %d invoices, %d receipts, "
-             "%d delivery notes, %d size balances",
+             "%d delivery notes, %d size balances, %d size ladders",
              frm, to, counts["sales_orders"], counts["invoices"],
              counts["receipts"], counts["delivery_notes"],
-             counts["size_balances"])
+             counts["size_balances"], counts.get("size_ladders", 0))
     return counts
 
 
