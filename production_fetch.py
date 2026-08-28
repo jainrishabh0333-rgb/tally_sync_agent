@@ -203,7 +203,7 @@ def push(client, vouchers: list[dict], chunk: int = 100) -> dict:
     Frappe Cloud's request limit is not generous. The endpoint is GUID-keyed
     and idempotent, so a chunk that fails can simply be sent again.
     """
-    totals = {"created": 0, "updated": 0, "skipped": 0}
+    totals = {"created": 0, "updated": 0, "unchanged": 0}
     for i in range(0, len(vouchers), chunk):
         res = client.upsert_production_entries(vouchers[i:i + chunk]) or {}
         msg = res.get("message", res) if isinstance(res, dict) else {}
