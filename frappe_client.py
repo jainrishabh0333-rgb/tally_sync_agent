@@ -350,6 +350,19 @@ class FrappeClient:
             json={"receipts": receipts},
         )
 
+    def upsert_production_entries(self, entries: list[dict[str, Any]]) -> dict:
+        """
+        Cutting, job work, pressing and packing — with their ITEM lines.
+
+        These vouchers carry no ledger value at all, so `upsert_vouchers`
+        mirrors them as zero-rupee headers and the whole factory flow is
+        invisible. This is the only path that carries what actually moved.
+        """
+        return self._call(
+            "POST", "/api/method/tally_bridge.api.upsert_production_entries",
+            json={"entries": entries},
+        )
+
     def upsert_stock_batches(self, batches: list[dict[str, Any]],
                              company: str) -> dict:
         return self._call(
