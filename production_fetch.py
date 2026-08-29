@@ -152,7 +152,10 @@ def fetch(cfg: TallyConfig, frm: date, to: date,
         h = _header(vel, cfg.company)
         if not h.get("guid"):
             continue
-        h["stage"] = STAGES.get(h.get("voucher_type", ""), "Other")
+        # _header is shared with sale/receipt mirrors and does not carry the
+        # voucher type; stage classification is the one consumer that needs it.
+        h["voucher_type"] = _text(vel.find("VOUCHERTYPENAME"))
+        h["stage"] = STAGES.get(h["voucher_type"], "Other")
         h["lines"] = _lines(vel)
         # A voucher with no inventory line is not a production event; keeping
         # it would inflate every count on the app's home screen with nothing.
