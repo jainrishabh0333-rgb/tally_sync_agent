@@ -2,6 +2,11 @@
     install_production_windows.ps1
     Registers the production-voucher fetch as a Windows Scheduled Task.
 
+    SINCE 31 AUG 2026 THIS IS OPTIONAL: the 15-minute sync now fetches
+    production vouchers itself and backfills history automatically
+    (production_fetch.run_incremental, called from sync.py). Install this
+    task only if you want a second, independent daily pass as well.
+
     Run in PowerShell **as Administrator** from the sync_agent folder:
 
         cd C:\tally_bridge

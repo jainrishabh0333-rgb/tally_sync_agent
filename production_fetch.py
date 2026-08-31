@@ -250,3 +250,64 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# Zero-touch mode: ride the 15-minute sync instead of asking a person
+# ---------------------------------------------------------------------------
+#
+# The owner's requirement, verbatim: "it will not be possible for me to run
+# that command every time." So nothing here is a command. sync.py calls
+# run_incremental() on every pass; each pass does two small things:
+#
+#   * the RECENT window — the last few days, re-read every pass so new and
+#     edited production vouchers land within 15 minutes like everything else;
+#   * one BACKFILL step — if history hasn't reached the anchor yet, one
+#     modest chunk further back. The mirror itself is the progress marker
+#     (its earliest production voucher), so there is no state file to lose,
+#     and a box rebuild resumes exactly where the data says it should.
+#
+# The 150-day history therefore assembles itself over ~a dozen syncs —
+# an afternoon of ordinary working hours — without one long pull that
+# would sit on Tally's gateway, and without anyone touching the server.
+
+RECENT_DAYS = 3
+BACKFILL_CHUNK_DAYS = 12
+BACKFILL_ANCHOR = date(2026, 4, 1)   # this book's opening day
+
+
+def plan_windows(today: date, earliest: "date | None",
+                 anchor: date = BACKFILL_ANCHOR) -> list[tuple[date, date]]:
+    """
+    The windows one pass should fetch. Pure, so the tests can hold it still.
+
+    Always the recent window; plus one chunk stepping back from the earliest
+    voucher already mirrored, until the anchor is reached. First-ever pass
+    (nothing mirrored) starts stepping back from today.
+    """
+    windows = [(today - timedelta(days=RECENT_DAYS), today)]
+    floor = earliest or today
+    if floor > anchor:
+        start = max(anchor, floor - timedelta(days=BACKFILL_CHUNK_DAYS))
+        windows.append((start, floor - timedelta(days=1)))
+    return windows
+
+
+def run_incremental(cfg: TallyConfig, fc) -> dict:
+    """
+    One pass worth of production mirroring. Called from sync.py; must never
+    raise past its own wall — production data is a passenger on the sync,
+    and a passenger does not get to crash the bus.
+    """
+    today = date.today()
+    earliest = fc.production_window(cfg.company)
+    counts = {"production_vouchers": 0, "production_backfill_to": ""}
+    for frm, to in plan_windows(today, earliest):
+        if frm > to:
+            continue
+        vouchers = fetch(cfg, frm, to)
+        if vouchers:
+            push(fc, vouchers)
+            counts["production_vouchers"] += len(vouchers)
+        counts["production_backfill_to"] = str(frm)
+    return counts

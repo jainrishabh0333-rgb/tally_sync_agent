@@ -364,6 +364,29 @@ class FrappeClient:
             json={"sizes": sizes, "company": company},
         )
 
+    def production_window(self, company: str) -> "Any":
+        """
+        The earliest production voucher date already mirrored, or None.
+
+        This IS the backfill's progress marker: the data says how far back
+        history reaches, so no state file exists to go stale or get deleted.
+        """
+        import json as _json
+        out = self._call(
+            "GET", "/api/resource/Tally Production Entry",
+            params={
+                "fields": _json.dumps(["min(voucher_date) as lo"]),
+                "filters": _json.dumps([["company", "=", company]]),
+                "limit_page_length": 0,
+            })
+        rows = out.get("data") or []
+        lo = rows[0].get("lo") if rows else None
+        if not lo:
+            return None
+        from datetime import date as _date
+        y, m, d = str(lo)[:10].split("-")
+        return _date(int(y), int(m), int(d))
+
     def upsert_production_entries(self, entries: list[dict[str, Any]]) -> dict:
         """
         Cutting, job work, pressing and packing — with their ITEM lines.

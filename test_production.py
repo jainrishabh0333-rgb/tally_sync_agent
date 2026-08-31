@@ -133,3 +133,37 @@ if failures:
     print(f"{len(failures)} FAILURE(S)")
     sys.exit(1)
 print("All production parsing tests passed.")
+
+
+def test_plan_windows_first_ever_pass():
+    """Nothing mirrored yet: recent window plus a first chunk back from today."""
+    from datetime import date, timedelta
+    from production_fetch import plan_windows, RECENT_DAYS, BACKFILL_CHUNK_DAYS
+    today = date(2026, 8, 31)
+    w = plan_windows(today, None)
+    assert w[0] == (today - timedelta(days=RECENT_DAYS), today)
+    assert w[1] == (today - timedelta(days=BACKFILL_CHUNK_DAYS),
+                    today - timedelta(days=1))
+
+
+def test_plan_windows_steps_back_until_anchor_then_stops():
+    from datetime import date, timedelta
+    from production_fetch import plan_windows, BACKFILL_ANCHOR, BACKFILL_CHUNK_DAYS
+    today = date(2026, 8, 31)
+    # mid-backfill: one chunk further back from the mirrored floor
+    floor = date(2026, 6, 15)
+    w = plan_windows(today, floor)
+    assert w[1] == (floor - timedelta(days=BACKFILL_CHUNK_DAYS),
+                    floor - timedelta(days=1))
+    # nearly there: the chunk clamps to the anchor, never before it
+    floor = BACKFILL_ANCHOR + timedelta(days=3)
+    w = plan_windows(today, floor)
+    assert w[1][0] == BACKFILL_ANCHOR
+    # done: anchor reached, only the recent window remains, forever
+    assert len(plan_windows(today, BACKFILL_ANCHOR)) == 1
+
+
+def test_plan_windows_anchor_is_the_books_opening_day():
+    from datetime import date
+    from production_fetch import BACKFILL_ANCHOR
+    assert BACKFILL_ANCHOR == date(2026, 4, 1)

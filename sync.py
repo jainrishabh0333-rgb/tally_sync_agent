@@ -672,11 +672,26 @@ def sync_distributor_docs(st: Settings, fc: FrappeClient,
     except Exception as exc:
         log.warning("Size-ladder walk skipped: %s", exc)
 
+    # Production vouchers ride the same pass — the owner's requirement is
+    # that nobody ever runs a command on this box. Recent window every pass;
+    # one history chunk per pass until the book's opening day is reached
+    # (the mirror's own earliest voucher is the progress marker). Guarded
+    # like the ladders: production is a passenger, never the driver.
+    try:
+        import production_fetch
+        pcounts = production_fetch.run_incremental(st.tally, fc)
+        counts.update(pcounts)
+    except Exception as exc:
+        log.warning("Production pass skipped: %s", exc)
+
     log.info("Distributor docs %s..%s: %d orders, %d invoices, %d receipts, "
-             "%d delivery notes, %d size balances, %d size ladders",
+             "%d delivery notes, %d size balances, %d size ladders, "
+             "%d production vouchers (history to %s)",
              frm, to, counts["sales_orders"], counts["invoices"],
              counts["receipts"], counts["delivery_notes"],
-             counts["size_balances"], counts.get("size_ladders", 0))
+             counts["size_balances"], counts.get("size_ladders", 0),
+             counts.get("production_vouchers", 0),
+             counts.get("production_backfill_to", "-"))
     return counts
 
 
