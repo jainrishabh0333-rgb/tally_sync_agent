@@ -42,7 +42,7 @@ import argparse
 import dataclasses
 import logging
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from reorder_fetch import (
     BUCKET_STITCHING,
@@ -51,8 +51,9 @@ from reorder_fetch import (
     BUCKET_WIP,
     classify_godown,
     fetch_godown_parents,
+    fetch_movements,
 )
-from reorder_refresh import LEVEL_DOCTYPE, collect_movements, fetch_baseline
+from reorder_refresh import LEVEL_DOCTYPE, fetch_baseline
 from tally_client import (
     TallyConfig,
     _fetch_master,
@@ -161,6 +162,71 @@ def pending_deduped(fc) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Movements — 3-day windows, cached, patient
+# ---------------------------------------------------------------------------
+
+def chunked_movements(cfg: TallyConfig, frm: date, to: date,
+                      units: dict, parents: dict) -> list:
+    """
+    The year's movements in 3-day windows with a disk checkpoint per window.
+
+    One request for the whole year can never return — a single day of this
+    book is ~17 MB of XML — and a run that dies mid-year must not start
+    over. Windows land in out/seed_cache and are skipped on restart; a
+    throttled Tally gets escalating waits instead of a dead run. Delete the
+    cache directory to force a fresh pull.
+    """
+    import dataclasses
+    import json
+    import os
+    import time
+
+    cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "out", "seed_cache")
+    os.makedirs(cache, exist_ok=True)
+
+    windows = []
+    d = frm
+    while d <= to:
+        e = min(d + timedelta(days=2), to)
+        windows.append((d, e))
+        d = e + timedelta(days=1)
+
+    all_rows: list = []
+    for wi, (w_frm, w_to) in enumerate(windows):
+        cf = os.path.join(cache, f"mv_{w_frm.isoformat()}.json")
+        if os.path.exists(cf):
+            with open(cf) as fh:
+                all_rows.extend(json.load(fh))
+            continue
+        tries = 0
+        while True:
+            tries += 1
+            try:
+                moves = [m for m in
+                         fetch_movements(cfg, w_frm, w_to, units, parents)
+                         if m.size_batch]
+                rows = [dataclasses.asdict(m) for m in moves]
+                with open(cf, "w") as fh:
+                    json.dump(rows, fh)
+                all_rows.extend(rows)
+                log.info("window %d/%d %s: %d movements",
+                         wi + 1, len(windows), w_frm, len(rows))
+                time.sleep(4)      # shared production box — be gentle
+                break
+            except Exception as exc:
+                if tries >= 10:
+                    raise
+                wait = min(180, 20 * tries)
+                log.warning("window %s attempt %d failed (%s) — waiting %ds",
+                            w_frm, tries, type(exc).__name__, wait)
+                time.sleep(wait)
+    log.info("movements total: %d rows across %d windows",
+             len(all_rows), len(windows))
+    return all_rows
+
+
+# ---------------------------------------------------------------------------
 # The seed itself
 # ---------------------------------------------------------------------------
 
@@ -172,7 +238,7 @@ def seed(cfg: TallyConfig, fc, dry_run: bool = False,
     units = {u.name: u for u in fetch_units(cfg)}
     parents = fetch_godown_parents(cfg)
     opening = fetch_openings(cfg, units, fy_start)
-    moves = collect_movements(cfg, fy_start, as_on)
+    moves = chunked_movements(cfg, fy_start, as_on, units, parents)
 
     # Stock group for rows this run CREATES — the mirror already knows it.
     group_of = {r["item_name"]: r.get("stock_group") or ""
@@ -186,7 +252,7 @@ def seed(cfg: TallyConfig, fc, dry_run: bool = False,
     for (item, size, godown), qty in opening.items():
         totals[(item, size, classify_godown(godown, parents))] += qty
     for m in moves:
-        totals[(m.item_name, m.size_batch, m.bucket)] += m.qty
+        totals[(m["item_name"], m["size_batch"], m["bucket"])] += m["qty"]
 
     pending = pending_deduped(fc)
 
