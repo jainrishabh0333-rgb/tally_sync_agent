@@ -110,6 +110,39 @@ l = _lines(v)[0]
 check("tag wins over a positive batch qty", l["direction"], "Consumed")
 check("batch qty used", l["qty"], 15.0)
 
+# ------------------------------------------------------------ double export
+# A build can answer with BOTH shapes at once — the same lines under the
+# typed lists and again under ALLINVENTORYENTRIES. Keeping both doubles
+# every mirrored quantity; the typed copy wins, the untyped copy goes.
+
+print("\na double export is deduplicated, typed lists win")
+v = vch("""
+ <INVENTORYENTRIESOUT.LIST>
+  <STOCKITEMNAME>COTTON LYCRA</STOCKITEMNAME>
+  <ACTUALQTY>-80.000 Kgs</ACTUALQTY>
+ </INVENTORYENTRIESOUT.LIST>
+ <INVENTORYENTRIESIN.LIST>
+  <STOCKITEMNAME>ANUSHKA-(Doz)</STOCKITEMNAME>
+  <ACTUALQTY>36.000 Doz</ACTUALQTY>
+ </INVENTORYENTRIESIN.LIST>
+ <ALLINVENTORYENTRIES.LIST>
+  <STOCKITEMNAME>COTTON LYCRA</STOCKITEMNAME>
+  <ACTUALQTY>80.000 Kgs</ACTUALQTY>
+ </ALLINVENTORYENTRIES.LIST>
+ <ALLINVENTORYENTRIES.LIST>
+  <STOCKITEMNAME>ANUSHKA-(Doz)</STOCKITEMNAME>
+  <ACTUALQTY>36.000 Doz</ACTUALQTY>
+ </ALLINVENTORYENTRIES.LIST>
+""")
+lines = _lines(v)
+check("only the typed lines survive", len(lines), 2)
+check_true("no untyped line rides along",
+           all(l["source_tag"] != "ALLINVENTORYENTRIES.LIST" for l in lines),
+           "- ALLINVENTORYENTRIES must be dropped when IN/OUT answered")
+check("the consumption keeps its typed direction",
+      [l["direction"] for l in lines if l["item_name"] == "COTTON LYCRA"],
+      ["Consumed"])
+
 # ------------------------------------------------------------------ misc
 print("\nrobustness")
 check("a line with no item name is dropped",

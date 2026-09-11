@@ -137,6 +137,17 @@ def _lines(vel) -> list[dict]:
                     "direction": fixed or ("Consumed" if bq < 0 else direction),
                     "rate": rate, "amount": amount, "source_tag": tag,
                 })
+
+    # Measured on a live build: it answers with BOTH the typed IN/OUT lists
+    # AND ALLINVENTORYENTRIES — every line arrives twice, and the untyped
+    # copy marks consumptions "Produced" (batch allocations write their
+    # quantities positive, so the sign heuristic misfires). Keeping both
+    # doubled every quantity in the mirror. The typed lists state the
+    # direction as fact, so when they answered they are the truth and the
+    # untyped copy is dropped; ALLINVENTORYENTRIES still stands alone on a
+    # build that sends only it.
+    if any(l["source_tag"] != "ALLINVENTORYENTRIES.LIST" for l in out):
+        out = [l for l in out if l["source_tag"] != "ALLINVENTORYENTRIES.LIST"]
     return out
 
 
