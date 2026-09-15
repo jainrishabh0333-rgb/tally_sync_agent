@@ -196,6 +196,47 @@ def test_plan_windows_steps_back_until_anchor_then_stops():
     assert len(plan_windows(today, BACKFILL_ANCHOR)) == 1
 
 
+def test_gap_window_finds_the_oldest_hole():
+    from datetime import date
+    from production_fetch import gap_window, BACKFILL_CHUNK_DAYS
+    today = date(2026, 9, 15)
+    book = {date(2026, 9, 5): 17, date(2026, 9, 7): 5, date(2026, 9, 8): 19}
+    mirror = {date(2026, 9, 8): 19}
+    frm, to = gap_window(book, mirror, today)
+    assert frm == date(2026, 9, 5)
+    # a chunk from 5 Sep would run past today — the window clamps to today
+    assert to == today
+    # with room to spare, it is a full chunk
+    frm2, to2 = gap_window(book, mirror, date(2026, 10, 30))
+    assert (frm2, to2) == (date(2026, 9, 5),
+                           date(2026, 9, 5) + __import__("datetime").timedelta(days=BACKFILL_CHUNK_DAYS - 1))
+
+
+def test_gap_window_complete_coverage_means_none():
+    from datetime import date
+    from production_fetch import gap_window
+    book = {date(2026, 9, 5): 17}
+    assert gap_window(book, {date(2026, 9, 5): 17}, date(2026, 9, 15)) is None
+    # more mirrored than booked = a deletion, not a gap
+    assert gap_window(book, {date(2026, 9, 5): 18}, date(2026, 9, 15)) is None
+    assert gap_window({}, {}, date(2026, 9, 15)) is None
+
+
+def test_gap_window_leaves_the_recent_window_alone():
+    from datetime import date
+    from production_fetch import gap_window, RECENT_DAYS
+    today = date(2026, 9, 15)
+    inside = today - __import__("datetime").timedelta(days=RECENT_DAYS - 1)
+    assert gap_window({inside: 4}, {}, today) is None
+
+
+def test_gap_window_never_reaches_before_the_anchor():
+    from datetime import date
+    from production_fetch import gap_window, BACKFILL_ANCHOR
+    before = BACKFILL_ANCHOR - __import__("datetime").timedelta(days=30)
+    assert gap_window({before: 9}, {}, date(2026, 9, 15)) is None
+
+
 def test_plan_windows_anchor_is_the_books_opening_day():
     from datetime import date
     from production_fetch import BACKFILL_ANCHOR

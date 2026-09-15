@@ -364,6 +364,32 @@ class FrappeClient:
             json={"sizes": sizes, "company": company},
         )
 
+    def production_coverage(self, company: str, vtypes: list) -> "Any":
+        """
+        Per-date counts of production-type vouchers on both sides of the
+        mirror: the voucher table (alter_id-synced, so it always has the
+        full book, backdated entries included) and the production-entry
+        table (date-windowed, so it can miss). A date where the first
+        count exceeds the second is a hole the windows never covered —
+        or a backdated voucher typed in after its window was long past.
+        """
+        import json as _json
+
+        def counts(doctype):
+            out = self._call(
+                "GET", f"/api/resource/{doctype}",
+                params={
+                    "fields": _json.dumps(["voucher_date", "count(name) as n"]),
+                    "filters": _json.dumps([["company", "=", company],
+                                            ["voucher_type", "in", vtypes]]),
+                    "group_by": "voucher_date",
+                    "limit_page_length": 0,
+                })
+            return {r["voucher_date"]: int(r["n"])
+                    for r in (out.get("data") or []) if r.get("voucher_date")}
+
+        return counts("Tally Voucher"), counts("Tally Production Entry")
+
     def production_window(self, company: str) -> "Any":
         """
         The earliest production voucher date already mirrored, or None.

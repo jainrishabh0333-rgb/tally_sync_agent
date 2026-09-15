@@ -307,6 +307,31 @@ def plan_windows(today: date, earliest: "date | None",
     return windows
 
 
+def gap_window(voucher_counts: dict, entry_counts: dict, today: date,
+               anchor: date = BACKFILL_ANCHOR,
+               chunk: int = BACKFILL_CHUNK_DAYS,
+               recent: int = RECENT_DAYS):
+    """
+    The oldest stretch where the book holds production vouchers the mirror
+    lacks, as one chunk-sized (frm, to) window — or None when coverage is
+    complete. Pure, so the tests can hold it still.
+
+    Dates inside the recent window are excluded (the recent fetch re-reads
+    them every pass anyway). A date where the mirror has MORE entries than
+    the book has vouchers is not a gap — that is a voucher deleted from
+    Tally, which pruning handles elsewhere. Backdated entries surface here
+    naturally: the day a voucher lands on an old date, that date's book
+    count grows past its mirrored count and the window gets re-read.
+    """
+    horizon = today - timedelta(days=recent)
+    gaps = [d for d, n in voucher_counts.items()
+            if anchor <= d < horizon and n > entry_counts.get(d, 0)]
+    if not gaps:
+        return None
+    start = min(gaps)
+    return start, min(start + timedelta(days=chunk - 1), today)
+
+
 def run_incremental(cfg: TallyConfig, fc) -> dict:
     """
     One pass worth of production mirroring. Called from sync.py; must never
@@ -324,4 +349,22 @@ def run_incremental(cfg: TallyConfig, fc) -> dict:
             push(fc, vouchers)
             counts["production_vouchers"] += len(vouchers)
         counts["production_backfill_to"] = str(frm)
+
+    # Gap sweep: one extra window per pass wherever the book has production
+    # vouchers the mirror lacks — middle holes from downtime, and vouchers
+    # backdated past the recent window. Guarded to the hilt: the sweep is a
+    # passenger on a passenger, and it does not get to crash anything.
+    try:
+        vc, ec = fc.production_coverage(cfg.company, list(STAGES))
+        as_dates = lambda m: {date.fromisoformat(str(k)[:10]): v
+                              for k, v in m.items()}
+        win = gap_window(as_dates(vc), as_dates(ec), today)
+        if win:
+            vouchers = fetch(cfg, win[0], win[1])
+            if vouchers:
+                push(fc, vouchers)
+                counts["production_vouchers"] += len(vouchers)
+            counts["production_gap_healed"] = f"{win[0]}..{win[1]}"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("production gap sweep skipped this pass: %s", exc)
     return counts
